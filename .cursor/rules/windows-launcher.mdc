@@ -1,0 +1,29 @@
+---
+description: Windows launcher and desktop shortcut conventions
+alwaysApply: true
+---
+
+# Launchers (Start.bat)
+
+## How to run from Desktop / elsewhere
+
+- **Do not** copy `Start.bat` alone. It resolves `eh_gallery_queue.py` via
+  `%~dp0` (next to the bat). A copy on Desktop fails silently or errors.
+- Prefer a **`.lnk` shortcut** that targets the project’s `Start.bat` and sets
+  WorkingDirectory to the project folder. Shortcuts can be moved freely.
+- Create/recreate with `Create-Desktop-Shortcut.bat` (writes
+  `EH Gallery Queue.lnk` on the Desktop).
+
+## Start.bat requirements
+
+- `cd /d "%~dp0"` then launch `"%~dp0eh_gallery_queue.py"`.
+- Prefer `pythonw` (no console); fall back to `python`.
+- If the `.py` is missing next to the bat, **print a clear error and pause** —
+  never `start` a missing script (silent failure).
+- If Python is not on PATH, print install/PATH guidance and pause.
+
+## Do not
+
+- Hardcode a user Desktop path into the repo.
+- Ship a second bat that only duplicates Start without resolving the project
+  script path.

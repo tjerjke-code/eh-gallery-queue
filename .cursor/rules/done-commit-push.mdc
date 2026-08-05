@@ -1,0 +1,40 @@
+---
+description: On user "done", commit and push when the task is finished
+alwaysApply: true
+---
+
+# Done → commit & push
+
+When the user says **done** (or clear equivalents like `done.`, `that's done`,
+`we're done`) after work in this conversation:
+
+## Do commit & push when all are true
+
+1. The **initial task** (or the agreed follow-ups in this chat) is implemented.
+2. **Nothing meaningful left** — no open questions, deferred TODOs from this
+   chat that still need code, or half-finished edits.
+3. There are **local changes** to commit (or commits ahead of remote to push).
+
+Then, without asking again:
+
+1. **Commit** using the repo git protocol (status/diff/log → stage relevant
+   files → message focuses on why → never secrets / force / amend unless
+   already allowed by user rules).
+2. **Push** the current branch to its remote (`git push -u origin HEAD` when
+   upstream is missing).
+
+## Do not
+
+- Treat “done” as commit+push if the task is incomplete, blocked, or you still
+  need a decision from the user — say what’s left instead.
+- Create an empty commit when the working tree is clean and the branch is
+  already pushed.
+- Push unrelated local WIP the user did not include in this task; stage only
+  files that belong to the finished work (ask if unclear).
+- Force-push, skip hooks, or amend unless the user’s standing git rules allow it.
+
+## Examples
+
+- User: “done” after a finished launcher fix with a dirty tree → commit + push.
+- User: “done” but a follow-up is still unwired → do **not** commit; list remaining work.
+- User: “done” with clean tree already on remote → report nothing to push.
