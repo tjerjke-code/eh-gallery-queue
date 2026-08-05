@@ -22,6 +22,23 @@ Then, without asking again:
    already allowed by user rules).
 2. **Push** the current branch to its remote (`git push -u origin HEAD` when
    upstream is missing).
+3. **Remove temp files** created for this task (see below) after a successful
+   push — do not leave probe/scratch artifacts in the tree.
+
+## Temp / scratch cleanup (required after push)
+
+Delete agent-created throwaways from this chat once the work is pushed:
+
+- `_tmp*`, `*_tmp*`, `*_probe*`, scratch scripts, one-off dumps (`.txt` /
+  `.json` / `.out` used only for inspection)
+- `__pycache__/` and `*.py[cod]` created while testing
+- Other files clearly made only to inspect, bench, or debug — not product code
+
+Do **not** delete: committed product files, `.env` / secrets, user IDE settings
+the user keeps (e.g. `.idea/` if local-only), or anything the user asked to keep.
+
+If cleanup removes only gitignored/untracked junk, no extra commit is needed.
+If a temp file was accidentally committed, delete it and commit+push that fix.
 
 ## Do not
 
@@ -32,6 +49,7 @@ Then, without asking again:
 - Push unrelated local WIP the user did not include in this task; stage only
   files that belong to the finished work (ask if unclear).
 - Force-push, skip hooks, or amend unless the user’s standing git rules allow it.
+- Leave probe/scratch/`__pycache__` leftovers after a successful done-push.
 
 ## Examples
 
