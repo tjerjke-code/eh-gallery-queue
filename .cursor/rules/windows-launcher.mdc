@@ -11,8 +11,8 @@ alwaysApply: true
   `%~dp0` (next to the bat). A copy on Desktop fails silently or errors.
 - Prefer a **`.lnk` shortcut** that targets the project’s `Start.bat` and sets
   WorkingDirectory to the project folder. Shortcuts can be moved freely.
-- Create/recreate with `Create-Desktop-Shortcut.bat` (writes
-  `EH Gallery Queue.lnk` on the Desktop).
+- Create the shortcut once via Windows (right-click Start.bat → Create
+  shortcut) or an equivalent `.lnk`; do not ship a helper bat for this.
 
 ## Start.bat requirements
 
@@ -25,5 +25,5 @@ alwaysApply: true
 ## Do not
 
 - Hardcode a user Desktop path into the repo.
-- Ship a second bat that only duplicates Start without resolving the project
-  script path.
+- Ship a second bat that only creates shortcuts or duplicates Start without
+  resolving the project script path.

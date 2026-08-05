@@ -7,9 +7,8 @@ if not exist "%SCRIPT%" (
   echo Could not find eh_gallery_queue.py next to this file:
   echo   %SCRIPT%
   echo.
-  echo Do not copy Start.bat alone. Use Create-Desktop-Shortcut.bat
-  echo to put a shortcut on your Desktop, or run Start.bat from the
-  echo project folder.
+  echo Do not copy Start.bat alone. Make a Windows shortcut to this
+  echo Start.bat in the project folder, or run it from there.
   pause
   exit /b 1
 )
