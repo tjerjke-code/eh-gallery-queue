@@ -1,8 +1,11 @@
 """Slow EH ``f_shash`` scanner (WishAssistance asset-queue style).
 
 Pending rows live in ``dbo.eh_sha_checks``. A background worker drains them
-at ~3s/search, records match galleries, and asks the UI to auto-enqueue
+at ~4s/search, records match galleries, and asks the UI to auto-enqueue
 new ``/g/`` URLs at the end of the parse queue.
+
+Ban / bandwidth responses leave the SHA pending and back off (do not mark
+``error``) so a temporary limit cannot burn the queue.
 """
 
 from __future__ import annotations
@@ -17,20 +20,34 @@ from urllib.parse import urljoin
 import requests
 from bs4 import BeautifulSoup
 
-from db import QueueStore, gallery_key_from_url
+from db import QueueStore
 from logger import get_logger, log_feed
 
 log = get_logger("eh_hash_check")
 
 HEADERS = {"User-Agent": "Mozilla/5.0"}
-SEARCH_INTERVAL = 3.5  # EH search limit ~1 / 3s
+SEARCH_INTERVAL = 4.0  # EH search ~1 / 3s; 4s leaves headroom under sustained load
 IDLE_SLEEP = 2.0
 SEED_BATCH = 2000
+# After a search ban, leave jobs pending and wait (exponential, capped).
+BAN_COOLDOWN_BASE = 15 * 60  # 15 min
+BAN_COOLDOWN_MAX = 2 * 60 * 60  # 2 h
+BAN_ERROR_SUBSTR = "ban / bandwidth"
 
 _GALLERY_HREF = re.compile(r"/g/(\d+)/([0-9a-fA-F]+)", re.IGNORECASE)
+_BAN_MARKERS = (
+    "temporarily banned",
+    "ban expires",
+    "exceeded your image",
+    "509 bandwidth",
+)
 
 OnMatchFn = Callable[[list[dict]], None]
 StatusFn = Callable[[str], None]
+
+
+class EhSearchBan(RuntimeError):
+    """EH refused a search (temp ban / bandwidth). Retry later — do not mark error."""
 
 
 def shash_search_url(digest: bytes) -> str:
@@ -104,6 +121,7 @@ class EhHashCheckWorker:
         self._thread: threading.Thread | None = None
         self._session = requests.Session()
         self._session.headers.update(HEADERS)
+        self._ban_strikes = 0
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -135,6 +153,18 @@ class EhHashCheckWorker:
     def _loop(self) -> None:
         seeded = False
         log_feed(log, logging.INFO, "EH hash-check worker started")
+        try:
+            n = self.store.requeue_sha_check_errors(error_substr=BAN_ERROR_SUBSTR)
+            if n:
+                log_feed(
+                    log,
+                    logging.INFO,
+                    "Requeued %s EH hash check(s) previously failed by ban/limit",
+                    n,
+                )
+        except Exception as e:
+            log.exception("requeue_sha_check_errors failed: %s", e)
+
         while not self._stop.is_set() and self.lifecycle_alive():
             if not self.enabled():
                 self._emit_status("EH scan paused")
@@ -185,8 +215,10 @@ class EhHashCheckWorker:
                 f"EH scan… {pending} pending — {digest.hex()[:10]}…"
             )
             t0 = time.monotonic()
+            ban_hit = False
             try:
                 matches = self._search(digest)
+                self._ban_strikes = 0
                 # Persist all hits; auto-queue filters completed/queued/origin.
                 self.store.finish_sha_check(digest, matches=matches)
                 to_queue = []
@@ -221,6 +253,29 @@ class EhHashCheckWorker:
                             digest.hex()[:10],
                             len(to_queue),
                         )
+            except EhSearchBan as e:
+                # claim_next leaves status=pending — do not finish as error.
+                ban_hit = True
+                self._ban_strikes = min(self._ban_strikes + 1, 8)
+                cooldown = min(
+                    BAN_COOLDOWN_MAX,
+                    BAN_COOLDOWN_BASE * (2 ** (self._ban_strikes - 1)),
+                )
+                mins = max(1, int(round(cooldown / 60)))
+                log.warning(
+                    "f_shash %s: %s — leaving pending, cooldown %sm",
+                    digest.hex()[:10],
+                    e,
+                    mins,
+                )
+                log_feed(
+                    log,
+                    logging.WARNING,
+                    "EH search ban/limit — pausing hash scan ~%s min (SHA left pending)",
+                    mins,
+                )
+                self._emit_status(f"EH scan paused (ban) ~{mins}m")
+                self._stop.wait(cooldown)
             except Exception as e:
                 log.warning("f_shash %s failed: %s", digest.hex()[:10], e)
                 try:
@@ -228,6 +283,8 @@ class EhHashCheckWorker:
                 except Exception:
                     pass
 
+            if ban_hit or self._stop.is_set():
+                continue
             elapsed = time.monotonic() - t0
             wait = max(0.0, self.interval - elapsed)
             if wait > 0:
@@ -241,14 +298,6 @@ class EhHashCheckWorker:
         r.raise_for_status()
         text = r.text or ""
         low = text.lower()
-        if any(
-            s in low
-            for s in (
-                "temporarily banned",
-                "ban expires",
-                "exceeded your image",
-                "509 bandwidth",
-            )
-        ):
-            raise RuntimeError("EH ban / bandwidth limit on search")
+        if any(s in low for s in _BAN_MARKERS):
+            raise EhSearchBan("EH ban / bandwidth limit on search")
         return parse_shash_results(text, base=str(r.url))

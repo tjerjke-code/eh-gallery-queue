@@ -1120,6 +1120,45 @@ class QueueStore:
             ).fetchone()
         return int(row[0] or 0) if row else 0
 
+    def requeue_sha_check_errors(self, *, error_substr: str | None = None) -> int:
+        """Reset ``error`` SHA checks back to ``pending`` (e.g. after a ban storm).
+
+        If ``error_substr`` is set, only rows whose ``last_error`` contains it
+        (case-insensitive) are requeued.
+        """
+        with self._lock:
+            cur = self._conn().cursor()
+            if error_substr:
+                needle = f"%{error_substr}%"
+                cur.execute(
+                    """
+                    UPDATE dbo.eh_sha_checks
+                    SET status = N'pending',
+                        last_error = NULL,
+                        match_count = 0,
+                        checked_at = NULL,
+                        updated_at = SYSUTCDATETIME()
+                    WHERE status = N'error'
+                      AND last_error LIKE ?
+                    """,
+                    needle,
+                )
+            else:
+                cur.execute(
+                    """
+                    UPDATE dbo.eh_sha_checks
+                    SET status = N'pending',
+                        last_error = NULL,
+                        match_count = 0,
+                        checked_at = NULL,
+                        updated_at = SYSUTCDATETIME()
+                    WHERE status = N'error'
+                    """
+                )
+            n = int(cur.rowcount or 0)
+            self._conn().commit()
+            return n
+
     def is_queued(self, url: str) -> bool:
         key = gallery_key_from_url(url)
         if not key:

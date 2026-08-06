@@ -2958,7 +2958,10 @@ class App(ttk.Frame):
             on_matches=self._on_eh_matches,
             on_status=self._on_eh_scan_status,
             lifecycle_alive=lambda: self._lifecycle_alive,
-            enabled=lambda: bool(self.eh_scan_var.get()),
+            # Pause f_shash while downloading — same IP budget as gallery traffic.
+            enabled=lambda: bool(self.eh_scan_var.get()) and not (
+                self._worker and self._worker.is_alive()
+            ),
         )
         self._hash_worker.start()
 
