@@ -20,6 +20,8 @@ RELOAD_DEPS = (
     'db',
     'activity_feed',
     'eh_hash_check',
+    'eh_title_search',
+    'local_import',
     'app',
 )
 
@@ -30,8 +32,8 @@ class HotReloadShell(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title('EH Gallery Queue')
-        self.geometry('760x640')
-        self.minsize(560, 480)
+        self.geometry('900x700')
+        self.minsize(640, 520)
 
         self.store = None
         self.app_frame = None

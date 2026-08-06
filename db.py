@@ -833,11 +833,135 @@ class QueueStore:
         key = gallery_key_from_url(url)
         if not key:
             return False
+        return self.is_queued_key(key)
+
+    def is_queued_key(self, key: str) -> bool:
+        if not key:
+            return False
         with self._lock:
             row = self._conn().cursor().execute(
                 "SELECT 1 FROM dbo.queue_items WHERE gallery_key = ?", key
             ).fetchone()
         return bool(row)
+
+    def is_completed_key(self, key: str) -> bool:
+        if not key:
+            return False
+        with self._lock:
+            row = self._conn().cursor().execute(
+                "SELECT 1 FROM dbo.galleries WHERE gallery_key = ?", key
+            ).fetchone()
+        return bool(row)
+
+    def find_gallery_by_key(self, key: str) -> dict | None:
+        if not key:
+            return None
+        with self._lock:
+            row = self._conn().cursor().execute(
+                """
+                SELECT gallery_key, token, url, title, out_dir, image_total
+                FROM dbo.galleries
+                WHERE gallery_key = ?
+                """,
+                key,
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "gallery_key": row[0],
+            "token": row[1],
+            "url": row[2],
+            "title": row[3],
+            "out_dir": row[4],
+            "image_total": row[5],
+        }
+
+    def find_gallery_by_out_dir(self, out_dir: str) -> dict | None:
+        """Match completed gallery by full folder path (case-insensitive on Windows)."""
+        path = (out_dir or "").strip()
+        if not path:
+            return None
+        leaf = Path(path).name
+        with self._lock:
+            cur = self._conn().cursor()
+            row = cur.execute(
+                """
+                SELECT TOP 1 gallery_key, token, url, title, out_dir, image_total
+                FROM dbo.galleries
+                WHERE out_dir = ?
+                   OR LOWER(out_dir) = LOWER(?)
+                ORDER BY id DESC
+                """,
+                path,
+                path,
+            ).fetchone()
+            if not row and leaf:
+                row = cur.execute(
+                    """
+                    SELECT TOP 1 gallery_key, token, url, title, out_dir, image_total
+                    FROM dbo.galleries
+                    WHERE title = ?
+                    ORDER BY id DESC
+                    """,
+                    leaf,
+                ).fetchone()
+        if not row:
+            return None
+        return {
+            "gallery_key": row[0],
+            "token": row[1],
+            "url": row[2],
+            "title": row[3],
+            "out_dir": row[4],
+            "image_total": row[5],
+        }
+
+    def find_queue_by_out_dir(self, out_dir: str) -> dict | None:
+        path = (out_dir or "").strip()
+        if not path:
+            return None
+        leaf = Path(path).name
+        with self._lock:
+            row = self._conn().cursor().execute(
+                """
+                SELECT TOP 1 gallery_key, url, title, out_dir, status
+                FROM dbo.queue_items
+                WHERE out_dir = ?
+                   OR LOWER(out_dir) = LOWER(?)
+                   OR title = ?
+                ORDER BY id DESC
+                """,
+                path,
+                path,
+                leaf,
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "gallery_key": row[0],
+            "url": row[1],
+            "title": row[2],
+            "out_dir": row[3],
+            "status": row[4],
+        }
+
+    def local_folder_status(self, folder: str | Path) -> dict:
+        """DB / queue status for a local gallery folder path."""
+        folder = Path(folder)
+        path = str(folder)
+        gal = self.find_gallery_by_out_dir(path)
+        q = self.find_queue_by_out_dir(path)
+        return {
+            "path": path,
+            "name": folder.name,
+            "in_galleries": bool(gal),
+            "in_queue": bool(q),
+            "gallery": gal,
+            "queue": q,
+            "gallery_key": (gal or q or {}).get("gallery_key"),
+            "url": (gal or q or {}).get("url"),
+            "title": (gal or q or {}).get("title"),
+        }
 
     def remove_by_url(self, url: str) -> None:
         key = gallery_key_from_url(url)

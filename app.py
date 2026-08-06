@@ -28,7 +28,9 @@ from db import (
     normalize_image_links,
     strip_order_prefix,
 )
-from eh_hash_check import EhHashCheckWorker
+from eh_hash_check import EhHashCheckWorker, SEARCH_INTERVAL
+from eh_title_search import default_session, search_by_folder_name
+from local_import import import_local_gallery, list_images, scan_gallery_folders
 from logger import get_logger, log_feed
 
 log = get_logger('app')
@@ -567,7 +569,11 @@ class App(ttk.Frame):
         self._current_url = None
         self._hash_worker: EhHashCheckWorker | None = None
         self._eh_scan_status = ''
+        self._import_rows: dict[str, dict] = {}
+        self._import_stop = threading.Event()
+        self._import_busy = False
 
+        # --- shared: Save to ---
         top = ttk.Frame(self, padding=8)
         top.pack(fill='x')
 
@@ -576,11 +582,33 @@ class App(ttk.Frame):
         ttk.Entry(top, textvariable=self.dir_var).pack(side='left', fill='x', expand=True, padx=4)
         ttk.Button(top, text='Browse…', command=self.browse_dir).pack(side='left')
 
-        opts = ttk.Frame(self, padding=(8, 0))
+        nb = ttk.Notebook(self)
+        nb.pack(fill='both', expand=True, padx=4, pady=(0, 4))
+        self._notebook = nb
+
+        queue_tab = ttk.Frame(nb)
+        import_tab = ttk.Frame(nb)
+        nb.add(queue_tab, text='Queue')
+        nb.add(import_tab, text='Import')
+
+        self._build_queue_tab(queue_tab)
+        self._build_import_tab(import_tab)
+
+        self.status = tk.StringVar(value='Idle')
+        ttk.Label(self, textvariable=self.status, padding=8).pack(fill='x')
+
+        self._hydrate_from_store()
+        self._start_hash_worker()
+        log_feed(log, logging.INFO, 'UI ready')
+
+    def _build_queue_tab(self, parent: ttk.Frame):
+        opts = ttk.Frame(parent, padding=(8, 4))
         opts.pack(fill='x')
         ttk.Label(opts, text='Workers:').pack(side='left')
         self.workers_var = tk.IntVar(value=DEFAULT_WORKERS)
-        ttk.Spinbox(opts, from_=1, to=8, width=4, textvariable=self.workers_var).pack(side='left', padx=4)
+        ttk.Spinbox(opts, from_=1, to=8, width=4, textvariable=self.workers_var).pack(
+            side='left', padx=4
+        )
         ttk.Label(opts, text='(3–4 safe · higher = faster, more ban risk)').pack(side='left')
         self.eh_scan_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
@@ -590,7 +618,7 @@ class App(ttk.Frame):
             command=self._on_eh_scan_toggle,
         ).pack(side='right')
 
-        add_row = ttk.Frame(self, padding=(8, 4))
+        add_row = ttk.Frame(parent, padding=(8, 4))
         add_row.pack(fill='x')
         ttk.Label(add_row, text='URL:').pack(side='left')
         self.url_var = tk.StringVar()
@@ -599,7 +627,7 @@ class App(ttk.Frame):
         self.url_entry.bind('<Return>', lambda e: self.add_url())
         ttk.Button(add_row, text='Add to queue', command=self.add_url).pack(side='left')
 
-        mid = ttk.Frame(self, padding=8)
+        mid = ttk.Frame(parent, padding=8)
         mid.pack(fill='both', expand=True)
 
         left = ttk.Frame(mid)
@@ -629,16 +657,81 @@ class App(ttk.Frame):
             fill='x', pady=(12, 2)
         )
 
-        ttk.Label(self, text='Log', padding=(8, 0)).pack(anchor='w')
-        self.log_box = scrolledtext.ScrolledText(self, height=14, state='disabled', wrap='word')
+        ttk.Label(parent, text='Log', padding=(8, 0)).pack(anchor='w')
+        self.log_box = scrolledtext.ScrolledText(
+            parent, height=12, state='disabled', wrap='word'
+        )
         self.log_box.pack(fill='both', expand=True, padx=8, pady=(0, 8))
 
-        self.status = tk.StringVar(value='Idle')
-        ttk.Label(self, textvariable=self.status, padding=8).pack(fill='x')
+    def _build_import_tab(self, parent: ttk.Frame):
+        help_row = ttk.Frame(parent, padding=(8, 6))
+        help_row.pack(fill='x')
+        ttk.Label(
+            help_row,
+            text='Scan Save-to folders → search EH by title → import into DB / queue',
+        ).pack(side='left')
 
-        self._hydrate_from_store()
-        self._start_hash_worker()
-        log_feed(log, logging.INFO, 'UI ready')
+        tools = ttk.Frame(parent, padding=(8, 0))
+        tools.pack(fill='x')
+        ttk.Button(tools, text='Scan', command=self.import_scan).pack(side='left')
+        ttk.Button(
+            tools, text='Search unmatched', command=self.import_search_unmatched
+        ).pack(side='left', padx=4)
+        ttk.Button(
+            tools, text='Search selected', command=self.import_search_selected
+        ).pack(side='left')
+        ttk.Button(tools, text='Stop search', command=self.import_stop_search).pack(
+            side='left', padx=4
+        )
+        ttk.Button(
+            tools, text='Import selected', command=self.import_selected
+        ).pack(side='left', padx=(12, 0))
+        ttk.Button(
+            tools, text='Enqueue selected', command=self.import_enqueue_selected
+        ).pack(side='left', padx=4)
+
+        cols = ('folder', 'files', 'db', 'queue', 'match', 'score')
+        tree_frame = ttk.Frame(parent, padding=8)
+        tree_frame.pack(fill='both', expand=True)
+        self.import_tree = ttk.Treeview(
+            tree_frame,
+            columns=cols,
+            show='headings',
+            selectmode='extended',
+            height=12,
+        )
+        self.import_tree.heading('folder', text='Folder')
+        self.import_tree.heading('files', text='Files')
+        self.import_tree.heading('db', text='DB')
+        self.import_tree.heading('queue', text='Queue')
+        self.import_tree.heading('match', text='EH match')
+        self.import_tree.heading('score', text='Score')
+        self.import_tree.column('folder', width=320, stretch=True)
+        self.import_tree.column('files', width=50, stretch=False, anchor='center')
+        self.import_tree.column('db', width=70, stretch=False, anchor='center')
+        self.import_tree.column('queue', width=70, stretch=False, anchor='center')
+        self.import_tree.column('match', width=280, stretch=True)
+        self.import_tree.column('score', width=50, stretch=False, anchor='center')
+        yscroll = ttk.Scrollbar(
+            tree_frame, orient='vertical', command=self.import_tree.yview
+        )
+        self.import_tree.configure(yscrollcommand=yscroll.set)
+        self.import_tree.pack(side='left', fill='both', expand=True)
+        yscroll.pack(side='right', fill='y')
+        self.import_tree.bind('<<TreeviewSelect>>', self._on_import_select)
+
+        ov = ttk.Frame(parent, padding=(8, 4))
+        ov.pack(fill='x')
+        ttk.Label(ov, text='Override URL:').pack(side='left')
+        self.import_url_var = tk.StringVar()
+        self.import_url_entry = ttk.Entry(ov, textvariable=self.import_url_var)
+        self.import_url_entry.pack(side='left', fill='x', expand=True, padx=4)
+        ttk.Button(ov, text='Apply to selected', command=self.import_apply_url).pack(
+            side='left'
+        )
+
+        self.import_status = tk.StringVar(value='Scan Save-to to list local galleries.')
+        ttk.Label(parent, textvariable=self.import_status, padding=(8, 4)).pack(fill='x')
 
     def _request_reload(self):
         shell = self.winfo_toplevel()
@@ -649,6 +742,7 @@ class App(ttk.Frame):
         """Stop workers before the shell destroys this frame (WishAssistance-style)."""
         self._lifecycle_alive = False
         self._stop.set()
+        self._import_stop.set()
         hw = self._hash_worker
         self._hash_worker = None
         if hw:
@@ -667,6 +761,414 @@ class App(ttk.Frame):
         self._worker = None
         self._current_url = None
         log.info('prepare_for_reload: workers stopped')
+
+    # --- Import tab ---
+
+    def _import_selected_iids(self) -> list[str]:
+        return list(self.import_tree.selection())
+
+    def _on_import_select(self, _event=None):
+        iids = self._import_selected_iids()
+        if len(iids) != 1:
+            return
+        row = self._import_rows.get(iids[0])
+        if not row:
+            return
+        url = row.get('match_url') or row.get('url') or ''
+        if url:
+            self.import_url_var.set(url)
+
+    def _import_row_values(self, row: dict) -> tuple:
+        match = ''
+        score = ''
+        if row.get('match_title') or row.get('match_key'):
+            key = row.get('match_key') or ''
+            title = (row.get('match_title') or '')[:80]
+            match = f'{key} {title}'.strip()
+            sc = row.get('match_score')
+            if sc is not None:
+                score = f'{float(sc):.2f}'
+        elif row.get('search_error'):
+            match = f"err: {row['search_error'][:60]}"
+        elif row.get('searched') and not row.get('match_key'):
+            match = '(no hit)'
+        return (
+            row.get('name') or '',
+            str(row.get('files') or 0),
+            'yes' if row.get('in_galleries') else '—',
+            'yes' if row.get('in_queue') else '—',
+            match,
+            score,
+        )
+
+    def _import_refresh_row(self, iid: str):
+        row = self._import_rows.get(iid)
+        if not row or not self._lifecycle_alive:
+            return
+        try:
+            self.import_tree.item(iid, values=self._import_row_values(row))
+        except tk.TclError:
+            pass
+
+    def import_scan(self):
+        if self._import_busy:
+            messagebox.showinfo('Import', 'Search/import still running — stop first.')
+            return
+        root = Path(self.dir_var.get().strip() or DEFAULT_DIR)
+        if not root.is_dir():
+            messagebox.showwarning('Import', f'Folder not found:\n{root}')
+            return
+        for iid in self.import_tree.get_children():
+            self.import_tree.delete(iid)
+        self._import_rows.clear()
+
+        folders = scan_gallery_folders(root)
+        for folder in folders:
+            st = {}
+            if self.store:
+                try:
+                    st = self.store.local_folder_status(folder)
+                except Exception as e:
+                    self.ui_log(f'Import status failed: {e}')
+            files = list_images(folder)
+            row = {
+                'path': str(folder),
+                'name': folder.name,
+                'files': len(files),
+                'in_galleries': bool(st.get('in_galleries')),
+                'in_queue': bool(st.get('in_queue')),
+                'url': st.get('url'),
+                'gallery_key': st.get('gallery_key'),
+                'match_key': None,
+                'match_token': None,
+                'match_url': None,
+                'match_title': None,
+                'match_score': None,
+                'match_hits': [],
+                'searched': False,
+                'search_error': None,
+            }
+            # Pre-fill match from DB if known
+            if st.get('gallery') or st.get('queue'):
+                src = st.get('gallery') or st.get('queue') or {}
+                row['match_key'] = src.get('gallery_key')
+                row['match_url'] = src.get('url')
+                row['match_title'] = src.get('title') or folder.name
+                row['match_score'] = 1.0
+            iid = self.import_tree.insert('', 'end', values=self._import_row_values(row))
+            self._import_rows[iid] = row
+
+        msg = f'Scanned {len(folders)} gallery folder(s) under {root}'
+        self.import_status.set(msg)
+        self.ui_log(msg)
+        log_feed(log, logging.INFO, 'Import scan: %s folder(s)', len(folders))
+
+    def import_stop_search(self):
+        self._import_stop.set()
+        self.import_status.set('Stopping search…')
+
+    def import_search_selected(self):
+        iids = self._import_selected_iids()
+        if not iids:
+            messagebox.showinfo('Import', 'Select one or more rows.')
+            return
+        self._start_import_search(iids)
+
+    def import_search_unmatched(self):
+        iids = [
+            iid for iid, row in self._import_rows.items()
+            if not row.get('in_galleries')
+            and not row.get('match_key')
+            and not row.get('in_queue')
+        ]
+        if not iids:
+            messagebox.showinfo('Import', 'No unmatched folders to search.')
+            return
+        self._start_import_search(iids)
+
+    def _start_import_search(self, iids: list[str]):
+        if self._import_busy:
+            messagebox.showinfo('Import', 'Search already running.')
+            return
+        if not iids:
+            return
+        self._import_busy = True
+        self._import_stop.clear()
+        self.import_status.set(f'Searching EH titles… 0/{len(iids)}')
+        threading.Thread(
+            target=self._import_search_worker,
+            args=(list(iids),),
+            daemon=True,
+        ).start()
+
+    def _import_search_worker(self, iids: list[str]):
+        session = default_session()
+        total = len(iids)
+        done = 0
+        try:
+            for i, iid in enumerate(iids):
+                if not self._lifecycle_alive or self._import_stop.is_set():
+                    break
+                row = self._import_rows.get(iid)
+                if not row:
+                    continue
+                name = row.get('name') or ''
+                try:
+                    self.after(
+                        0,
+                        lambda d=done, t=total, n=name[:50]: self.import_status.set(
+                            f'Searching EH… {d}/{t} — {n}'
+                        ),
+                    )
+                except tk.TclError:
+                    break
+                if i > 0:
+                    # Space out folder searches.
+                    t_end = time.monotonic() + SEARCH_INTERVAL
+                    while time.monotonic() < t_end:
+                        if not self._lifecycle_alive or self._import_stop.is_set():
+                            break
+                        time.sleep(0.15)
+                if not self._lifecycle_alive or self._import_stop.is_set():
+                    break
+                try:
+                    hits, query = search_by_folder_name(
+                        session,
+                        name,
+                        interval=SEARCH_INTERVAL,
+                        should_stop=lambda: (
+                            not self._lifecycle_alive or self._import_stop.is_set()
+                        ),
+                    )
+                    row['searched'] = True
+                    row['search_error'] = None
+                    row['match_hits'] = hits
+                    if hits:
+                        best = hits[0]
+                        row['match_key'] = best.get('gallery_key')
+                        row['match_token'] = best.get('token')
+                        row['match_url'] = best.get('url')
+                        row['match_title'] = best.get('title')
+                        row['match_score'] = best.get('score')
+                        # Cross-check queue / DB by matched gid
+                        if self.store and row['match_key']:
+                            try:
+                                key = row['match_key']
+                                row['in_galleries'] = self.store.is_completed_key(key)
+                                row['in_queue'] = self.store.is_queued_key(key)
+                            except Exception:
+                                pass
+                        self.ui_log(
+                            f"Import match: {name[:60]!r} → {row['match_key']} "
+                            f"(q={query!r})"
+                        )
+                    else:
+                        row['match_key'] = None
+                        row['match_url'] = None
+                        row['match_title'] = None
+                        row['match_score'] = None
+                        self.ui_log(f'Import no hit: {name[:60]!r}')
+                except Exception as e:
+                    row['searched'] = True
+                    row['search_error'] = str(e)
+                    self.ui_log(f'Import search error ({name[:40]}): {e}')
+                done += 1
+                try:
+                    self.after(0, lambda i=iid: self._import_refresh_row(i))
+                except tk.TclError:
+                    break
+        finally:
+            self._import_busy = False
+            if self._lifecycle_alive:
+                try:
+                    self.after(
+                        0,
+                        lambda d=done, t=total: self.import_status.set(
+                            f'Search done — {d}/{t}'
+                            + (' (stopped)' if self._import_stop.is_set() else '')
+                        ),
+                    )
+                except tk.TclError:
+                    pass
+
+    def import_apply_url(self):
+        url = self.import_url_var.get().strip()
+        if not url or '/g/' not in url or not gallery_key_from_url(url):
+            messagebox.showwarning('Import', 'Paste a valid e-hentai /g/… URL.')
+            return
+        iids = self._import_selected_iids()
+        if not iids:
+            messagebox.showinfo('Import', 'Select a folder row first.')
+            return
+        key = gallery_key_from_url(url)
+        for iid in iids:
+            row = self._import_rows.get(iid)
+            if not row:
+                continue
+            row['match_url'] = url.split('#', 1)[0].split('?', 1)[0]
+            row['match_key'] = key
+            row['match_title'] = row.get('match_title') or row.get('name')
+            row['match_score'] = 1.0
+            row['searched'] = True
+            if self.store:
+                try:
+                    row['in_galleries'] = self.store.is_completed_key(key)
+                    row['in_queue'] = self.store.is_queued_key(key)
+                except Exception:
+                    pass
+            self._import_refresh_row(iid)
+        self.import_status.set(f'Applied URL to {len(iids)} row(s)')
+
+    def import_selected(self):
+        if not self.store:
+            messagebox.showwarning('Import', 'Database not ready.')
+            return
+        if self._import_busy:
+            messagebox.showinfo('Import', 'Wait for search to finish.')
+            return
+        iids = self._import_selected_iids()
+        if not iids:
+            messagebox.showinfo('Import', 'Select rows with an EH match.')
+            return
+        self._import_busy = True
+        self._import_stop.clear()
+        threading.Thread(
+            target=self._import_do_worker,
+            args=(list(iids),),
+            daemon=True,
+        ).start()
+
+    def _import_do_worker(self, iids: list[str]):
+        ok = 0
+        skipped = 0
+        try:
+            for iid in iids:
+                if not self._lifecycle_alive or self._import_stop.is_set():
+                    break
+                row = self._import_rows.get(iid)
+                if not row:
+                    continue
+                url = (row.get('match_url') or '').strip()
+                if not url or not gallery_key_from_url(url):
+                    skipped += 1
+                    self.ui_log(f"Import skip (no URL): {row.get('name')}")
+                    continue
+                key = gallery_key_from_url(url)
+                try:
+                    if self.store.is_completed_key(key):
+                        skipped += 1
+                        row['in_galleries'] = True
+                        self.ui_log(f'Import skip (already in DB): {key}')
+                        self.after(0, lambda i=iid: self._import_refresh_row(i))
+                        continue
+                    if self.store.is_queued_key(key):
+                        skipped += 1
+                        row['in_queue'] = True
+                        self.ui_log(f'Import skip (in queue): {key}')
+                        self.after(0, lambda i=iid: self._import_refresh_row(i))
+                        continue
+                    folder = Path(row['path'])
+                    title = row.get('match_title') or row.get('name')
+                    stats = import_local_gallery(
+                        self.store,
+                        folder,
+                        url,
+                        title=title,
+                        fingerprint=True,
+                    )
+                    row['in_galleries'] = True
+                    row['gallery_key'] = key
+                    ok += 1
+                    self.ui_log(
+                        f"Imported {key} — fp={stats.get('fingerprinted', 0)} "
+                        f"files={stats.get('image_count', 0)}"
+                    )
+                    log_feed(
+                        log,
+                        logging.INFO,
+                        'Imported local gallery %s (%s files)',
+                        key,
+                        stats.get('image_count', 0),
+                    )
+                except Exception as e:
+                    self.ui_log(f'Import failed {key}: {e}')
+                    log.exception('import failed: %s', e)
+                try:
+                    self.after(0, lambda i=iid: self._import_refresh_row(i))
+                except tk.TclError:
+                    break
+        finally:
+            self._import_busy = False
+            if self._lifecycle_alive:
+                try:
+                    self.after(
+                        0,
+                        lambda o=ok, s=skipped: self.import_status.set(
+                            f'Import done — {o} imported, {s} skipped'
+                        ),
+                    )
+                except tk.TclError:
+                    pass
+
+    def import_enqueue_selected(self):
+        if not self.store:
+            messagebox.showwarning('Import', 'Database not ready.')
+            return
+        iids = self._import_selected_iids()
+        if not iids:
+            messagebox.showinfo('Import', 'Select rows with an EH match.')
+            return
+        added = 0
+        for iid in iids:
+            row = self._import_rows.get(iid)
+            if not row:
+                continue
+            url = (row.get('match_url') or '').strip()
+            if not url or not gallery_key_from_url(url):
+                continue
+            key = gallery_key_from_url(url)
+            if any(gallery_key_from_url(u) == key for u in self._queue_urls):
+                row['in_queue'] = True
+                self._import_refresh_row(iid)
+                continue
+            try:
+                if self.store.is_queued(url):
+                    row['in_queue'] = True
+                    self._import_refresh_row(iid)
+                    continue
+                if self.store.is_completed(url):
+                    if not messagebox.askyesno(
+                        'Already in DB',
+                        f'Gallery {key} is already completed.\nEnqueue to verify/fill gaps?',
+                    ):
+                        continue
+                self.store.enqueue(url, source='manual')
+                # Point queue meta at the local folder so download adopts it.
+                try:
+                    self.store.set_gallery_meta(
+                        url,
+                        title=row.get('match_title') or row.get('name'),
+                        out_dir=row.get('path'),
+                    )
+                except Exception:
+                    pass
+            except Exception as e:
+                self.ui_log(f'Enqueue failed: {e}')
+                continue
+            self._insert_queue_url(url, source='manual')
+            row['in_queue'] = True
+            self._import_refresh_row(iid)
+            added += 1
+            if self._worker and self._worker.is_alive():
+                self.job_queue.put(url)
+        if added:
+            log_feed(log, logging.INFO, 'Enqueued %s local match(es) for verify', added)
+            self._refresh_idle_status()
+            try:
+                self._notebook.select(0)
+            except tk.TclError:
+                pass
+        self.import_status.set(f'Enqueued {added} gallery(ies)')
 
     def _start_hash_worker(self):
         if not self.store or self._hash_worker:

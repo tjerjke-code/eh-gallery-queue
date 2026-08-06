@@ -30,6 +30,10 @@
 - Optional: filter control if the mixed list gets noisy.
 
 ## Done (recent)
+- Local Import tab: scan pics folders, EH title search (quoted `f_search` +
+  fallbacks), register into `galleries` + fingerprints, or enqueue to verify
+- EH title search helper (`eh_title_search`) — full folder names fail unquoted;
+  phrase quotes hit
 - EH `f_shash` slow check queue (`eh_sha_checks` / `eh_sha_match_galleries`)
   + background worker + auto-enqueue (`source=auto`, end of queue)
 - Ordered prefixes (`01_` / `001_` / …) from gallery total
