@@ -6,3 +6,7 @@ venv/
 .env
 .idea/
 *.log
+logs/
+_tmp*
+*_tmp*
+*_probe*

@@ -1,0 +1,922 @@
+"""MSSQL persistence for EH gallery queue.
+
+Uses a dedicated ``EH`` database on the same SQL Server as WishAssistance.
+In-progress queue + per-image rows are temporary; successful galleries leave
+only a top-level ``galleries`` row for dedupe.
+"""
+
+from __future__ import annotations
+
+import configparser
+import re
+import threading
+from pathlib import Path
+
+import pyodbc
+
+_REPO = Path(__file__).resolve().parent
+_GALLERY_RE = re.compile(r"/g/(\d+)/([0-9a-fA-F]+)")
+# EH image page: /s/{img_key}/{gallery_id}-{page}
+_IMAGE_PAGE_RE = re.compile(
+    r"/s/([0-9a-fA-F]+)/(\d+)-(\d+)", re.IGNORECASE
+)
+_WIN_BAD = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+_WISH_SETTINGS = (
+    Path(r"C:\Users\Spleen\PycharmProjects\WishAsisstance\secrets\settings.cnf"),
+    Path(r"D:\PycharmProjects\WishAsisstance\secrets\settings.cnf"),
+)
+
+
+def gallery_key_from_url(url: str) -> str | None:
+    m = _GALLERY_RE.search(url or "")
+    return m.group(1) if m else None
+
+
+def gallery_token_from_url(url: str) -> str | None:
+    m = _GALLERY_RE.search(url or "")
+    return m.group(2) if m else None
+
+
+def image_page_id(page_url: str) -> str | None:
+    """Stable identity for an EH image page (not the display filename)."""
+    m = _IMAGE_PAGE_RE.search(page_url or "")
+    if not m:
+        return None
+    return f"{m.group(1).lower()}:{m.group(2)}:{m.group(3)}"
+
+
+def _safe_filename(name: str) -> str:
+    name = _WIN_BAD.sub("_", (name or "").strip(" ."))
+    return (name[:180] or "image")
+
+
+def index_pad_width(total: int) -> int:
+    """Digit width for order prefixes: ≤99 → 2, ≤999 → 3, …"""
+    return max(2, len(str(max(1, int(total)))))
+
+
+def strip_order_prefix(filename: str, width: int) -> str:
+    """Remove leading zero-padded ``NNN_`` only when digit count == width."""
+    m = re.match(r"^(\d+)_(.*)$", filename or "", flags=re.DOTALL)
+    if not m:
+        return filename
+    if len(m.group(1)) != int(width):
+        return filename
+    return m.group(2) or filename
+
+
+def apply_order_prefix(index_1based: int, filename: str, total: int) -> str:
+    """``{idx:0Wd}_{bare}`` — keeps pretty thumb names, sortable by gallery order."""
+    w = index_pad_width(total)
+    bare = strip_order_prefix(filename, w)
+    bare = _safe_filename(bare)
+    return f"{int(index_1based):0{w}d}_{bare}"[:260]
+
+
+def normalize_image_links(
+    links: list[tuple[str, str]],
+    *,
+    total: int | None = None,
+) -> list[tuple[str, str]]:
+    """Keep pretty EH names; ignore same page; suffix name collisions; add order idx.
+
+    - Same image page listed twice → keep first.
+    - First use of a display name → keep as-is (``0.jpg``).
+    - Later different pages with the same name → ``0_1.jpg``, ``0_2.jpg``, …
+    - Then prefix ``01_`` / ``001_`` / … from gallery order (pad by ``total``).
+    """
+    seen_pages: set[str] = set()
+    used_names: set[str] = set()
+    staged: list[tuple[str, str]] = []
+    for page_url, name in links:
+        page_url = (page_url or "").strip()
+        if not page_url:
+            continue
+        pid = image_page_id(page_url) or page_url
+        if pid in seen_pages:
+            continue
+        seen_pages.add(pid)
+
+        base = _safe_filename(name)
+        if base not in used_names:
+            candidate = base
+        else:
+            stem, dot, ext = base.rpartition(".")
+            if not dot:
+                stem, ext = base, ""
+            n = 1
+            while True:
+                candidate = f"{stem}_{n}.{ext}" if dot else f"{stem}_{n}"
+                if candidate not in used_names:
+                    break
+                n += 1
+        used_names.add(candidate)
+        staged.append((page_url, candidate))
+
+    width_total = max(len(staged), int(total or 0), 1)
+    return [
+        (url, apply_order_prefix(i, fn, width_total))
+        for i, (url, fn) in enumerate(staged, start=1)
+    ]
+
+
+def _load_odbc_parts() -> dict[str, str]:
+    """Local secrets first, else WishAssistance settings (database forced to EH)."""
+    local = _REPO / "secrets" / "settings.cnf"
+    candidates = [local, *_WISH_SETTINGS]
+    for path in candidates:
+        if not path.is_file():
+            continue
+        cfg = configparser.RawConfigParser()
+        cfg.read(path)
+        section = "EH_DB" if cfg.has_section("EH_DB") else "WIKI_DB"
+        if not cfg.has_section(section):
+            continue
+        c = dict(cfg[section])
+        return {
+            "driver": c["driver"],
+            "server": c["server"],
+            "database": "EH",
+            "uid": c["uid"],
+            "pwd": c["pwd"],
+            "source": str(path),
+        }
+    raise FileNotFoundError(
+        "No DB settings found. Copy secrets/settings.cnf.example to "
+        "secrets/settings.cnf (or keep WishAssistance secrets/settings.cnf)."
+    )
+
+
+# Keep UI from freezing forever when SQL Server is busy / wedged.
+_LOGIN_TIMEOUT_S = 5
+
+
+def _conn_str(parts: dict[str, str], database: str | None = None) -> str:
+    return (
+        f"DRIVER={parts['driver']};"
+        f"SERVER={parts['server']};"
+        f"DATABASE={database or parts['database']};"
+        f"UID={parts['uid']};"
+        f"PWD={parts['pwd']};"
+        f"LoginTimeout={_LOGIN_TIMEOUT_S};"
+        f"TrustServerCertificate=yes;"
+    )
+
+
+class QueueStore:
+    """Thread-safe EH queue / gallery store."""
+
+    def __init__(self):
+        self._parts = _load_odbc_parts()
+        self._lock = threading.RLock()
+        self._local = threading.local()
+        self._ensure_database()
+        self._ensure_schema()
+
+    def _conn(self) -> pyodbc.Connection:
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = pyodbc.connect(
+                _conn_str(self._parts),
+                autocommit=False,
+                timeout=_LOGIN_TIMEOUT_S,
+            )
+            self._local.conn = conn
+        return conn
+
+    def _ensure_database(self) -> None:
+        # CREATE DATABASE cannot run inside an explicit multi-statement txn
+        # on some setups; use a short-lived autocommit connection to master.
+        master = pyodbc.connect(
+            _conn_str(self._parts, "master"),
+            autocommit=True,
+            timeout=_LOGIN_TIMEOUT_S,
+        )
+        try:
+            cur = master.cursor()
+            exists = cur.execute(
+                "SELECT 1 FROM sys.databases WHERE name = N'EH'"
+            ).fetchone()
+            if not exists:
+                cur.execute("CREATE DATABASE [EH]")
+        finally:
+            master.close()
+
+    def _ensure_schema(self) -> None:
+        with self._lock:
+            cur = self._conn().cursor()
+            cur.execute(
+                """
+                IF OBJECT_ID(N'dbo.galleries', N'U') IS NULL
+                CREATE TABLE dbo.galleries (
+                    id            INT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+                    gallery_key   NVARCHAR(64)  NOT NULL,
+                    token         NVARCHAR(64)  NULL,
+                    url           NVARCHAR(512) NOT NULL,
+                    title         NVARCHAR(256) NULL,
+                    out_dir       NVARCHAR(512) NULL,
+                    image_total   INT NULL,
+                    saved         INT NULL,
+                    skipped       INT NULL,
+                    failed        INT NULL,
+                    completed_at  DATETIME2 NOT NULL
+                        CONSTRAINT DF_galleries_completed
+                        DEFAULT (SYSUTCDATETIME()),
+                    CONSTRAINT UQ_galleries_key UNIQUE (gallery_key)
+                );
+
+                IF OBJECT_ID(N'dbo.queue_items', N'U') IS NULL
+                CREATE TABLE dbo.queue_items (
+                    id            INT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+                    gallery_key   NVARCHAR(64)  NOT NULL,
+                    url           NVARCHAR(512) NOT NULL,
+                    title         NVARCHAR(256) NULL,
+                    out_dir       NVARCHAR(512) NULL,
+                    status        NVARCHAR(32)  NOT NULL,
+                    position      INT NOT NULL
+                        CONSTRAINT DF_queue_position DEFAULT (0),
+                    image_total   INT NULL,
+                    saved         INT NOT NULL
+                        CONSTRAINT DF_queue_saved DEFAULT (0),
+                    skipped       INT NOT NULL
+                        CONSTRAINT DF_queue_skipped DEFAULT (0),
+                    failed        INT NOT NULL
+                        CONSTRAINT DF_queue_failed DEFAULT (0),
+                    last_error    NVARCHAR(1000) NULL,
+                    created_at    DATETIME2 NOT NULL
+                        CONSTRAINT DF_queue_created DEFAULT (SYSUTCDATETIME()),
+                    updated_at    DATETIME2 NOT NULL
+                        CONSTRAINT DF_queue_updated DEFAULT (SYSUTCDATETIME()),
+                    CONSTRAINT UQ_queue_gallery_key UNIQUE (gallery_key)
+                );
+
+                IF OBJECT_ID(N'dbo.queue_images', N'U') IS NULL
+                CREATE TABLE dbo.queue_images (
+                    id            BIGINT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+                    queue_id      INT NOT NULL
+                        CONSTRAINT FK_queue_images_item
+                        REFERENCES dbo.queue_items(id) ON DELETE CASCADE,
+                    page_url      NVARCHAR(512) NOT NULL,
+                    filename      NVARCHAR(260) NOT NULL,
+                    status        NVARCHAR(32)  NOT NULL,
+                    last_error    NVARCHAR(1000) NULL,
+                    updated_at    DATETIME2 NOT NULL
+                        CONSTRAINT DF_qimg_updated DEFAULT (SYSUTCDATETIME()),
+                    CONSTRAINT UQ_queue_images_file UNIQUE (queue_id, filename)
+                );
+
+                IF OBJECT_ID(N'dbo.app_settings', N'U') IS NULL
+                CREATE TABLE dbo.app_settings (
+                    [key]   NVARCHAR(64)  NOT NULL PRIMARY KEY,
+                    value   NVARCHAR(512) NOT NULL
+                );
+
+                -- Exact-file identity (20 bytes) + optional 64-bit dHash for later resize-tolerant match.
+                -- ~40B/row without path; sample_path only for the first seen copy.
+                IF OBJECT_ID(N'dbo.image_fingerprints', N'U') IS NULL
+                CREATE TABLE dbo.image_fingerprints (
+                    sha1         BINARY(20)   NOT NULL PRIMARY KEY,
+                    byte_len     INT          NOT NULL,
+                    dhash        BIGINT       NULL,
+                    sample_path  NVARCHAR(400) NULL,
+                    gallery_key  NVARCHAR(64)  NULL,
+                    seen_count   INT          NOT NULL
+                        CONSTRAINT DF_fp_seen DEFAULT (1),
+                    created_at   DATETIME2    NOT NULL
+                        CONSTRAINT DF_fp_created DEFAULT (SYSUTCDATETIME()),
+                    updated_at   DATETIME2    NOT NULL
+                        CONSTRAINT DF_fp_updated DEFAULT (SYSUTCDATETIME())
+                );
+
+                IF NOT EXISTS (
+                    SELECT 1 FROM sys.indexes
+                    WHERE name = N'IX_queue_items_status'
+                      AND object_id = OBJECT_ID(N'dbo.queue_items')
+                )
+                CREATE INDEX IX_queue_items_status
+                    ON dbo.queue_items (status, position);
+
+                IF NOT EXISTS (
+                    SELECT 1 FROM sys.indexes
+                    WHERE name = N'IX_image_fp_dhash'
+                      AND object_id = OBJECT_ID(N'dbo.image_fingerprints')
+                )
+                CREATE INDEX IX_image_fp_dhash
+                    ON dbo.image_fingerprints (dhash)
+                    WHERE dhash IS NOT NULL;
+
+                -- Meta / alternate names for the same bytes across galleries (soft rename history).
+                IF OBJECT_ID(N'dbo.image_name_aliases', N'U') IS NULL
+                CREATE TABLE dbo.image_name_aliases (
+                    id           BIGINT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+                    sha1         BINARY(20)    NOT NULL
+                        CONSTRAINT FK_fp_alias_sha
+                        REFERENCES dbo.image_fingerprints(sha1),
+                    name         NVARCHAR(260) NOT NULL,
+                    bare_name    NVARCHAR(260) NULL,
+                    gallery_key  NVARCHAR(64)  NOT NULL
+                        CONSTRAINT DF_fp_alias_gkey DEFAULT (N''),
+                    sample_path  NVARCHAR(400) NULL,
+                    created_at   DATETIME2     NOT NULL
+                        CONSTRAINT DF_fp_alias_created DEFAULT (SYSUTCDATETIME()),
+                    CONSTRAINT UQ_fp_alias UNIQUE (sha1, name, gallery_key)
+                );
+
+                IF NOT EXISTS (
+                    SELECT 1 FROM sys.indexes
+                    WHERE name = N'IX_fp_alias_bare'
+                      AND object_id = OBJECT_ID(N'dbo.image_name_aliases')
+                )
+                CREATE INDEX IX_fp_alias_bare
+                    ON dbo.image_name_aliases (bare_name)
+                    WHERE bare_name IS NOT NULL;
+
+                IF NOT EXISTS (
+                    SELECT 1 FROM sys.indexes
+                    WHERE name = N'IX_fp_alias_sha'
+                      AND object_id = OBJECT_ID(N'dbo.image_name_aliases')
+                )
+                CREATE INDEX IX_fp_alias_sha
+                    ON dbo.image_name_aliases (sha1);
+                """
+            )
+            self._conn().commit()
+
+    def lookup_sha1(self, digest: bytes) -> dict | None:
+        """Return first-seen row for an exact file hash, or None."""
+        if not digest or len(digest) != 20:
+            return None
+        with self._lock:
+            row = self._conn().cursor().execute(
+                """
+                SELECT sample_path, byte_len, gallery_key, seen_count, dhash
+                FROM dbo.image_fingerprints
+                WHERE sha1 = ?
+                """,
+                digest,
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "sample_path": row[0],
+            "byte_len": int(row[1]) if row[1] is not None else None,
+            "gallery_key": row[2],
+            "seen_count": int(row[3] or 0),
+            "dhash": int(row[4]) if row[4] is not None else None,
+        }
+
+    def list_name_aliases(self, digest: bytes) -> list[dict]:
+        """All known names for this content (cross-gallery meta)."""
+        if not digest or len(digest) != 20:
+            return []
+        with self._lock:
+            rows = self._conn().cursor().execute(
+                """
+                SELECT name, bare_name, gallery_key, sample_path, created_at
+                FROM dbo.image_name_aliases
+                WHERE sha1 = ?
+                ORDER BY created_at ASC, id ASC
+                """,
+                digest,
+            ).fetchall()
+        return [
+            {
+                "name": r[0],
+                "bare_name": r[1],
+                "gallery_key": r[2] or "",
+                "sample_path": r[3],
+                "created_at": r[4],
+            }
+            for r in rows
+        ]
+
+    def record_name_alias(
+        self,
+        digest: bytes,
+        *,
+        name: str,
+        bare_name: str | None = None,
+        gallery_key: str | None = None,
+        sample_path: str | None = None,
+    ) -> None:
+        """Remember a filename variant for this sha1 (does not move files)."""
+        if not digest or len(digest) != 20:
+            return
+        name = (name or "").strip()[:260]
+        if not name:
+            return
+        bare = (bare_name or "").strip()[:260] or None
+        gkey = (gallery_key or "").strip()[:64] or ""
+        path = (sample_path or "").strip()[:400] or None
+        with self._lock:
+            cur = self._conn().cursor()
+            # Fingerprint row must exist (FK).
+            if not cur.execute(
+                "SELECT 1 FROM dbo.image_fingerprints WHERE sha1 = ?", digest
+            ).fetchone():
+                return
+            cur.execute(
+                """
+                MERGE dbo.image_name_aliases AS t
+                USING (
+                    SELECT
+                        ? AS sha1,
+                        ? AS name,
+                        ? AS bare_name,
+                        ? AS gallery_key,
+                        ? AS sample_path
+                ) AS s
+                ON t.sha1 = s.sha1
+                   AND t.name = s.name
+                   AND t.gallery_key = s.gallery_key
+                WHEN MATCHED THEN UPDATE SET
+                    bare_name = COALESCE(s.bare_name, t.bare_name),
+                    sample_path = COALESCE(s.sample_path, t.sample_path)
+                WHEN NOT MATCHED THEN INSERT
+                    (sha1, name, bare_name, gallery_key, sample_path)
+                VALUES
+                    (s.sha1, s.name, s.bare_name, s.gallery_key, s.sample_path);
+                """,
+                digest,
+                name,
+                bare,
+                gkey,
+                path,
+            )
+            self._conn().commit()
+
+    def register_sha1(
+        self,
+        digest: bytes,
+        byte_len: int,
+        *,
+        sample_path: str | None = None,
+        gallery_key: str | None = None,
+        dhash: int | None = None,
+        name: str | None = None,
+        bare_name: str | None = None,
+    ) -> bool:
+        """Upsert exact fingerprint (+ optional name alias). Returns True if sha1 was new.
+
+        First-seen ``sample_path`` stays the canonical on-disk copy. Later galleries
+        only bump ``seen_count`` and record aliases — soft meta for set matching.
+        """
+        if not digest or len(digest) != 20:
+            raise ValueError("sha1 digest must be 20 bytes")
+        path = (sample_path or "")[:400] or None
+        gkey = (gallery_key or "")[:64] or None
+        with self._lock:
+            cur = self._conn().cursor()
+            row = cur.execute(
+                "SELECT 1 FROM dbo.image_fingerprints WHERE sha1 = ?", digest
+            ).fetchone()
+            is_new = not row
+            if row:
+                cur.execute(
+                    """
+                    UPDATE dbo.image_fingerprints
+                    SET seen_count = seen_count + 1,
+                        dhash = COALESCE(?, dhash),
+                        updated_at = SYSUTCDATETIME()
+                    WHERE sha1 = ?
+                    """,
+                    dhash,
+                    digest,
+                )
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO dbo.image_fingerprints
+                        (sha1, byte_len, dhash, sample_path, gallery_key)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    digest,
+                    int(byte_len),
+                    dhash,
+                    path,
+                    gkey,
+                )
+            self._conn().commit()
+
+        alias_name = (name or "").strip() or (
+            Path(path).name if path else ""
+        )
+        if alias_name:
+            self.record_name_alias(
+                digest,
+                name=alias_name,
+                bare_name=bare_name,
+                gallery_key=gkey,
+                sample_path=path,
+            )
+        return is_new
+
+    def get_setting(self, key: str, default: str | None = None) -> str | None:
+        with self._lock:
+            row = self._conn().cursor().execute(
+                "SELECT value FROM dbo.app_settings WHERE [key] = ?", key
+            ).fetchone()
+            return row[0] if row else default
+
+    def set_setting(self, key: str, value: str) -> None:
+        with self._lock:
+            cur = self._conn().cursor()
+            cur.execute(
+                """
+                MERGE dbo.app_settings AS t
+                USING (SELECT ? AS [key], ? AS value) AS s
+                ON t.[key] = s.[key]
+                WHEN MATCHED THEN UPDATE SET value = s.value
+                WHEN NOT MATCHED THEN INSERT ([key], value) VALUES (s.[key], s.value);
+                """,
+                key,
+                value,
+            )
+            self._conn().commit()
+
+    def is_completed(self, url: str) -> bool:
+        key = gallery_key_from_url(url)
+        if not key:
+            return False
+        with self._lock:
+            row = self._conn().cursor().execute(
+                "SELECT 1 FROM dbo.galleries WHERE gallery_key = ?", key
+            ).fetchone()
+            return bool(row)
+
+    def list_active_queue(self) -> list[dict]:
+        """Pending / stopped / failed / running items, ordered for the UI."""
+        with self._lock:
+            rows = self._conn().cursor().execute(
+                """
+                SELECT id, gallery_key, url, title, out_dir, status, position,
+                       image_total, saved, skipped, failed, last_error
+                FROM dbo.queue_items
+                WHERE status IN (N'pending', N'stopped', N'failed', N'running')
+                ORDER BY position ASC, id ASC
+                """
+            ).fetchall()
+        return [
+            {
+                "id": r[0],
+                "gallery_key": r[1],
+                "url": r[2],
+                "title": r[3],
+                "out_dir": r[4],
+                "status": r[5],
+                "position": r[6],
+                "image_total": r[7],
+                "saved": r[8],
+                "skipped": r[9],
+                "failed": r[10],
+                "last_error": r[11],
+            }
+            for r in rows
+        ]
+
+    def enqueue(self, url: str, position: int | None = None) -> int:
+        key = gallery_key_from_url(url)
+        if not key:
+            raise ValueError("URL is not an e-hentai /g/ gallery link")
+        token = gallery_token_from_url(url)
+        with self._lock:
+            cur = self._conn().cursor()
+            existing = cur.execute(
+                "SELECT id, status FROM dbo.queue_items WHERE gallery_key = ?",
+                key,
+            ).fetchone()
+            if existing:
+                return int(existing[0])
+            if position is None:
+                row = cur.execute(
+                    "SELECT ISNULL(MAX(position), -1) + 1 FROM dbo.queue_items"
+                ).fetchone()
+                position = int(row[0]) if row else 0
+            cur.execute(
+                """
+                INSERT INTO dbo.queue_items
+                    (gallery_key, url, title, status, position)
+                OUTPUT INSERTED.id
+                VALUES (?, ?, NULL, N'pending', ?)
+                """,
+                key,
+                url.strip(),
+                position,
+            )
+            qid = int(cur.fetchone()[0])
+            # Keep token available via URL; optional future column fill
+            _ = token
+            self._conn().commit()
+            return qid
+
+    def remove_by_url(self, url: str) -> None:
+        key = gallery_key_from_url(url)
+        if not key:
+            return
+        with self._lock:
+            self._conn().cursor().execute(
+                "DELETE FROM dbo.queue_items WHERE gallery_key = ?", key
+            )
+            self._conn().commit()
+
+    def clear_queue(self) -> None:
+        with self._lock:
+            cur = self._conn().cursor()
+            cur.execute("DELETE FROM dbo.queue_images")
+            cur.execute("DELETE FROM dbo.queue_items")
+            self._conn().commit()
+
+    def resequence(self, urls: list[str]) -> None:
+        """Set position from current UI order; drop items no longer listed."""
+        with self._lock:
+            cur = self._conn().cursor()
+            keys = []
+            for i, url in enumerate(urls):
+                key = gallery_key_from_url(url)
+                if not key:
+                    continue
+                keys.append(key)
+                cur.execute(
+                    """
+                    UPDATE dbo.queue_items
+                    SET position = ?, url = ?, updated_at = SYSUTCDATETIME()
+                    WHERE gallery_key = ?
+                    """,
+                    i,
+                    url.strip(),
+                    key,
+                )
+            if keys:
+                placeholders = ",".join("?" * len(keys))
+                cur.execute(
+                    f"DELETE FROM dbo.queue_items WHERE gallery_key NOT IN ({placeholders})",
+                    keys,
+                )
+            else:
+                cur.execute("DELETE FROM dbo.queue_items")
+            self._conn().commit()
+
+    def mark_running(self, url: str, out_dir: str | None = None) -> int | None:
+        key = gallery_key_from_url(url)
+        if not key:
+            return None
+        with self._lock:
+            cur = self._conn().cursor()
+            cur.execute(
+                """
+                UPDATE dbo.queue_items
+                SET status = N'running',
+                    out_dir = COALESCE(?, out_dir),
+                    last_error = NULL,
+                    updated_at = SYSUTCDATETIME()
+                WHERE gallery_key = ?
+                """,
+                out_dir,
+                key,
+            )
+            row = cur.execute(
+                "SELECT id FROM dbo.queue_items WHERE gallery_key = ?", key
+            ).fetchone()
+            self._conn().commit()
+            return int(row[0]) if row else None
+
+    def mark_stopped(self, url: str) -> None:
+        key = gallery_key_from_url(url)
+        if not key:
+            return
+        with self._lock:
+            self._conn().cursor().execute(
+                """
+                UPDATE dbo.queue_items
+                SET status = N'stopped', updated_at = SYSUTCDATETIME()
+                WHERE gallery_key = ? AND status = N'running'
+                """,
+                key,
+            )
+            self._conn().commit()
+
+    def mark_failed(self, url: str, error: str) -> None:
+        key = gallery_key_from_url(url)
+        if not key:
+            return
+        with self._lock:
+            self._conn().cursor().execute(
+                """
+                UPDATE dbo.queue_items
+                SET status = N'failed',
+                    last_error = ?,
+                    updated_at = SYSUTCDATETIME()
+                WHERE gallery_key = ?
+                """,
+                (error or "")[:1000],
+                key,
+            )
+            self._conn().commit()
+
+    def set_gallery_meta(
+        self,
+        url: str,
+        *,
+        title: str | None = None,
+        out_dir: str | None = None,
+        image_total: int | None = None,
+    ) -> None:
+        key = gallery_key_from_url(url)
+        if not key:
+            return
+        with self._lock:
+            self._conn().cursor().execute(
+                """
+                UPDATE dbo.queue_items
+                SET title = COALESCE(?, title),
+                    out_dir = COALESCE(?, out_dir),
+                    image_total = COALESCE(?, image_total),
+                    updated_at = SYSUTCDATETIME()
+                WHERE gallery_key = ?
+                """,
+                title,
+                out_dir,
+                image_total,
+                key,
+            )
+            self._conn().commit()
+
+    def replace_images(self, url: str, links: list[tuple[str, str]]) -> int | None:
+        """Replace per-image temp rows. ``links`` must already be normalized
+        (ordered unique filenames from :func:`normalize_image_links`).
+        """
+        key = gallery_key_from_url(url)
+        if not key:
+            return None
+        with self._lock:
+            conn = self._conn()
+            cur = conn.cursor()
+            try:
+                row = cur.execute(
+                    "SELECT id FROM dbo.queue_items WHERE gallery_key = ?", key
+                ).fetchone()
+                if not row:
+                    return None
+                qid = int(row[0])
+                cur.execute("DELETE FROM dbo.queue_images WHERE queue_id = ?", qid)
+                inserted = 0
+                seen: set[str] = set()
+                for page_url, filename in links:
+                    page_url = (page_url or "").strip()
+                    filename = (filename or "").strip()
+                    if not page_url or not filename:
+                        continue
+                    pid = image_page_id(page_url) or page_url
+                    if pid in seen:
+                        continue
+                    seen.add(pid)
+                    cur.execute(
+                        """
+                        INSERT INTO dbo.queue_images
+                            (queue_id, page_url, filename, status)
+                        VALUES (?, ?, ?, N'pending')
+                        """,
+                        qid,
+                        page_url[:512],
+                        filename[:260],
+                    )
+                    inserted += 1
+                cur.execute(
+                    """
+                    UPDATE dbo.queue_items
+                    SET image_total = ?, saved = 0, skipped = 0, failed = 0,
+                        updated_at = SYSUTCDATETIME()
+                    WHERE id = ?
+                    """,
+                    inserted,
+                    qid,
+                )
+                conn.commit()
+                return qid
+            except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                raise
+
+    def update_image(
+        self,
+        url: str,
+        filename: str,
+        status: str,
+        *,
+        error: str | None = None,
+        bump: str | None = None,
+    ) -> None:
+        """Update one image row; optional bump is 'saved'|'skipped'|'failed'."""
+        key = gallery_key_from_url(url)
+        if not key:
+            return
+        with self._lock:
+            cur = self._conn().cursor()
+            row = cur.execute(
+                "SELECT id FROM dbo.queue_items WHERE gallery_key = ?", key
+            ).fetchone()
+            if not row:
+                return
+            qid = int(row[0])
+            cur.execute(
+                """
+                UPDATE dbo.queue_images
+                SET status = ?,
+                    last_error = ?,
+                    updated_at = SYSUTCDATETIME()
+                WHERE queue_id = ? AND filename = ?
+                """,
+                status,
+                (error or "")[:1000] if error else None,
+                qid,
+                filename,
+            )
+            if bump in ("saved", "skipped", "failed"):
+                cur.execute(
+                    f"""
+                    UPDATE dbo.queue_items
+                    SET [{bump}] = [{bump}] + 1,
+                        updated_at = SYSUTCDATETIME()
+                    WHERE id = ?
+                    """,
+                    qid,
+                )
+            self._conn().commit()
+
+    def complete_gallery(
+        self,
+        url: str,
+        *,
+        title: str | None,
+        out_dir: str | None,
+        image_total: int | None,
+        saved: int,
+        skipped: int,
+        failed: int,
+    ) -> None:
+        """Write permanent dedupe row and purge all temp queue data for this gallery."""
+        key = gallery_key_from_url(url)
+        if not key:
+            return
+        token = gallery_token_from_url(url)
+        with self._lock:
+            cur = self._conn().cursor()
+            cur.execute(
+                """
+                MERGE dbo.galleries AS t
+                USING (
+                    SELECT
+                        ? AS gallery_key,
+                        ? AS token,
+                        ? AS url,
+                        ? AS title,
+                        ? AS out_dir,
+                        ? AS image_total,
+                        ? AS saved,
+                        ? AS skipped,
+                        ? AS failed
+                ) AS s
+                ON t.gallery_key = s.gallery_key
+                WHEN MATCHED THEN UPDATE SET
+                    token = s.token,
+                    url = s.url,
+                    title = COALESCE(s.title, t.title),
+                    out_dir = COALESCE(s.out_dir, t.out_dir),
+                    image_total = s.image_total,
+                    saved = s.saved,
+                    skipped = s.skipped,
+                    failed = s.failed,
+                    completed_at = SYSUTCDATETIME()
+                WHEN NOT MATCHED THEN INSERT
+                    (gallery_key, token, url, title, out_dir,
+                     image_total, saved, skipped, failed)
+                VALUES
+                    (s.gallery_key, s.token, s.url, s.title, s.out_dir,
+                     s.image_total, s.saved, s.skipped, s.failed);
+                """,
+                key,
+                token,
+                url.strip(),
+                title,
+                out_dir,
+                image_total,
+                saved,
+                skipped,
+                failed,
+            )
+            # CASCADE deletes queue_images
+            cur.execute("DELETE FROM dbo.queue_items WHERE gallery_key = ?", key)
+            self._conn().commit()
+
+    def close(self) -> None:
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            self._local.conn = None

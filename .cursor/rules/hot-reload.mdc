@@ -1,0 +1,40 @@
+---
+description: Hot-reload (Ctrl+R) — keep process alive while iterating UI/DB code
+alwaysApply: true
+---
+
+# Hot reload (eh-gallery-queue)
+
+This app uses **Ctrl+R** (WishAssistance-style) so UI/downloader/DB code
+changes apply without restarting the process.
+
+## How it works
+
+- Entry: `eh_gallery_queue.py` → `HotReloadShell` (durable `tk.Tk`)
+- Reloadable UI/downloader: `app.py` (`App` is a `ttk.Frame`)
+- Shortcut: Ctrl+R → `HotReloadShell.reload_app`
+- Dep order in `RELOAD_DEPS`: `logger`, `db`, `activity_feed`, `app`
+- Teardown: `App.prepare_for_reload()` stops the download worker and marks
+  the current gallery stopped in DB before the frame is destroyed
+- Restore: async `QueueStore` reconnect + new `App` rehydrate from EH DB
+- Activity feed is owned by the shell and rebuilt on reload
+
+## When you add or extract code
+
+1. Put reloadable logic in `app.py` or a new module listed in `RELOAD_DEPS`
+   **before** `app`.
+2. If a new module is imported by `app.py`, add it to `RELOAD_DEPS` or Ctrl+R
+   keeps the stale module object.
+3. Anything with threads/`after()` must stop in `prepare_for_reload` and must
+   check `_lifecycle_alive` before touching widgets.
+4. Operational milestones should use `log_feed()` so they show in the activity
+   feed; routine download chatter stays in the Log box / DEBUG.
+
+## Do not
+
+- Connect to MSSQL on the UI thread without a login timeout (freezes the window).
+- Put UI rebuild logic only in `__main__` without a shell — restart would be
+  required for every edit.
+- Assume “import at top of app” is enough without a `RELOAD_DEPS` entry.
+- Leave download workers running across reload (race into destroyed widgets).
+- Call Tk/`after` from log publisher threads — feed uses a pending queue + drain.

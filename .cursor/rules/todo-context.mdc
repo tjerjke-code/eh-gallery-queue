@@ -1,0 +1,29 @@
+---
+description: Always check TODO.md for deferred product context before related work
+alwaysApply: true
+---
+
+# TODO context (eh-gallery-queue)
+
+Before implementing features that touch naming, sets, fingerprints, or
+gallery organization, **read [`TODO.md`](TODO.md)** at the repo root for open
+items and agreed direction.
+
+## Why
+
+Some work is intentionally deferred (e.g. filename → set matching rules the
+user will define later). Code already stores soft meta (SHA-1 + name aliases)
+so those rules can land without re-downloading.
+
+## Do
+
+- Skim **Open** sections in `TODO.md` when the task overlaps fingerprints,
+  aliases, renames, sets, or resize/dHash.
+- When closing or starting a deferred item, update its status in `TODO.md`.
+- Prefer extending `image_name_aliases` / soft rename over deleting name history.
+
+## Do not
+
+- Invent final set-matching rules without the user when the TODO says they
+  will provide them.
+- Overwrite or discard alternate filenames for the same SHA-1 — record aliases.
