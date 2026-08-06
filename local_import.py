@@ -294,11 +294,18 @@ def fingerprint_folder(
                 src = dest
         used.add(src.resolve())
         digest = sha1_file(src)
+        try:
+            from image_dhash import compute_dhash
+
+            dh = compute_dhash(src)
+        except Exception:
+            dh = None
         store.register_sha1(
             digest,
             src.stat().st_size,
             sample_path=str(src),
             gallery_key=gallery_key,
+            dhash=dh,
             name=ordered,
             bare_name=bare,
         )

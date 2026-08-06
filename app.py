@@ -12,6 +12,7 @@ import queue
 import re
 import threading
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from math import ceil
 from pathlib import Path
@@ -35,14 +36,17 @@ from eh_title_search import (
     search_by_sample_shash,
     verify_hit_against_folder,
 )
+from dhash_fill import DhashFillWorker
 from fs_links import (
     ensure_symlink,
     move_real_file,
     remove_path_if_link_or_dup,
     resolve_real_file,
+    same_entry,
     same_path,
     strip_peer_presence,
 )
+from image_dhash import DEFAULT_MAX_HAMMING, compute_dhash
 from local_import import (
     extract_toplevel_archives,
     import_local_gallery,
@@ -70,6 +74,19 @@ DUPED_COLOR_RIGHT = '#C05621'
 DUPED_COLOR_FOCUS = '#ECC94B'
 DUPED_NEIGHBOR_RADIUS = 3
 DUPED_THUMB_SIZE = 86
+DUPED_COMPARE_SIZE = 220
+DUPED_BOARD_THUMB_W = 56
+DUPED_BOARD_THUMB_H = 80
+DUPED_BOARD_BATCH = 2
+DUPED_COMPARE_WIN_W = 520
+DUPED_COMPARE_WIN_H = 700
+DUPED_MANUAL_HAMMING = 255
+# Cross-thread UI: workers never call Tk/after (Tcl lock stall on Windows).
+UI_DRAIN_MS = 50
+UI_DRAIN_BATCH = 40
+DUPED_THUMB_APPLY_PER_TICK = 12
+DUPED_THUMB_READY_MAX = 240
+DUPED_TREE_CHUNK = 60
 
 
 class DownloadStopped(Exception):
@@ -188,6 +205,7 @@ class EHDownloader:
         self.gallery_url = gallery_url
         self.on_meta = on_meta
         self._name_total = 1
+        self._dhash_worker = None  # App may attach DhashFillWorker for wake()
 
     def _session(self):
         s = getattr(self._local, 'session', None)
@@ -310,17 +328,31 @@ class EHDownloader:
         bare = None
         if name:
             bare = strip_order_prefix(name, index_pad_width(self._name_total))
+        dhash = None
+        if path:
+            try:
+                dhash = compute_dhash(path)
+            except Exception:
+                dhash = None
         try:
             self.store.register_sha1(
                 digest,
                 byte_len,
                 sample_path=str(path) if path else None,
                 gallery_key=gallery_key_from_url(self.gallery_url or ''),
+                dhash=dhash,
                 name=name,
                 bare_name=bare,
             )
         except Exception as e:
             self.log(f'  fp register failed: {e}')
+        # App owns the fill worker; EHDownloader must not assume the attribute.
+        worker = getattr(self, '_dhash_worker', None)
+        if dhash is not None and worker is not None:
+            try:
+                worker.wake()
+            except Exception:
+                pass
 
     def _bump(self, stats, key, pic_name=None, error=None):
         with self._stats_lock:
@@ -658,6 +690,11 @@ class App(ttk.Frame):
         self._current_url = None
         self._hash_worker: EhHashCheckWorker | None = None
         self._eh_scan_status = ''
+        # Plain bool — hash worker must not read BooleanVar (Tcl lock).
+        self._eh_scan_enabled = True
+        self._ui_pending: deque[tuple[object, tuple]] = deque()
+        self._ui_pending_lock = threading.Lock()
+        self._ui_drain_alive = True
         self._import_rows: dict[str, dict] = {}
         self._import_stop = threading.Event()
         self._import_busy = False
@@ -675,6 +712,27 @@ class App(ttk.Frame):
         self._duped_focus_key: str | None = None
         self._duped_seq_cache: dict[str, list[dict]] = {}
         self._duped_preview_ctx: dict | None = None
+        self._duped_mode = 'exact'  # exact | near
+        self._dhash_worker: DhashFillWorker | None = None
+        self._duped_compare_photos: list = []
+        self._duped_board_items: list[dict] = []
+        self._duped_board_loaded = 0
+        self._duped_linked_pairs: set[tuple[bytes, bytes]] = set()
+        self._duped_board_canvas: tk.Canvas | None = None
+        self._duped_board_window = None
+        self._duped_board_loading = False
+        self._duped_thumb_cache: dict[str, object] = {}
+        self._duped_thumb_gen = 0
+        self._duped_thumb_queue: queue.Queue = queue.Queue()
+        self._duped_thumb_thread: threading.Thread | None = None
+        self._duped_thumb_ready: deque = deque()
+        self._duped_thumb_ready_lock = threading.Lock()
+        self._duped_file_pop_gen = 0
+        self._duped_compare_win: tk.Toplevel | None = None
+        self._duped_compare_idx = 0
+        self._duped_compare_win_photos: list = []
+        self._duped_cw_widgets: dict = {}
+        self._duped_compare_reopen_after_refresh: int | None = None
 
         # --- shared: Save to ---
         top = ttk.Frame(self, padding=8)
@@ -704,7 +762,9 @@ class App(ttk.Frame):
         ttk.Label(self, textvariable=self.status, padding=8).pack(fill='x')
 
         self._hydrate_from_store()
+        self._start_ui_drain()
         self._start_hash_worker()
+        self._start_dhash_worker()
         log_feed(log, logging.INFO, 'UI ready')
 
     def _build_queue_tab(self, parent: ttk.Frame):
@@ -717,6 +777,7 @@ class App(ttk.Frame):
         )
         ttk.Label(opts, text='(3–4 safe · higher = faster, more ban risk)').pack(side='left')
         self.eh_scan_var = tk.BooleanVar(value=True)
+        self._eh_scan_enabled = True
         ttk.Checkbutton(
             opts,
             text='EH dupe scan',
@@ -880,56 +941,104 @@ class App(ttk.Frame):
         ttk.Label(
             help_row,
             text=(
-                'Hover a file = ±3 neighbors in this gallery (blue) vs peer (orange). '
-                'Move to home consolidates bytes; Strip peers removes leftover '
-                'symlinks/copies. Right-click → Explorer.'
+                'Exact = SHA-1. Near = dHash. Match board = index (\u00b13). '
+                'Double-click row/card \u2192 large compare. Right-click \u2192 Explorer.'
             ),
         ).pack(side='left')
 
         tools = ttk.Frame(parent, padding=(8, 0))
         tools.pack(fill='x')
         ttk.Button(tools, text='Refresh', command=self.duped_refresh).pack(side='left')
+
+        self.duped_mode_var = tk.StringVar(value='exact')
+        ttk.Radiobutton(
+            tools,
+            text='Exact SHA',
+            value='exact',
+            variable=self.duped_mode_var,
+            command=self._on_duped_mode_change,
+        ).pack(side='left', padx=(12, 0))
+        ttk.Radiobutton(
+            tools,
+            text='Near dHash',
+            value='near',
+            variable=self.duped_mode_var,
+            command=self._on_duped_mode_change,
+        ).pack(side='left', padx=(4, 0))
+
         self.duped_undecided_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
+        self.duped_undecided_chk = ttk.Checkbutton(
             tools,
             text='Undecided only',
             variable=self.duped_undecided_var,
             command=self.duped_refresh,
-        ).pack(side='left', padx=(12, 0))
+        )
+        self.duped_undecided_chk.pack(side='left', padx=(12, 0))
+
+        exact_tools = ttk.Frame(parent, padding=(8, 4))
+        exact_tools.pack(fill='x')
+        self._duped_exact_tools = exact_tools
         self.duped_links_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
-            tools,
+            exact_tools,
             text='Create symlinks in other galleries',
             variable=self.duped_links_var,
-        ).pack(side='left', padx=(12, 0))
+        ).pack(side='left')
         ttk.Button(
-            tools,
-            text='Move to home → selected',
+            exact_tools,
+            text='Move to home \u2192 selected',
             command=lambda: self.duped_apply_home(scope='selected'),
         ).pack(side='left', padx=(8, 2))
         ttk.Button(
-            tools,
-            text='Move to home → all listed',
+            exact_tools,
+            text='Move to home \u2192 all listed',
             command=lambda: self.duped_apply_home(scope='all'),
         ).pack(side='left', padx=2)
         ttk.Button(
-            tools,
-            text='Strip peers → selected',
+            exact_tools,
+            text='Strip peers \u2192 selected',
             command=lambda: self.duped_strip_peers(scope='selected'),
         ).pack(side='left', padx=(8, 2))
         ttk.Button(
-            tools,
-            text='Strip peers → all listed',
+            exact_tools,
+            text='Strip peers \u2192 all listed',
             command=lambda: self.duped_strip_peers(scope='all'),
         ).pack(side='left', padx=2)
 
-        paned = ttk.Panedwindow(parent, orient='horizontal')
-        paned.pack(fill='both', expand=True, padx=8, pady=8)
+        near_tools = ttk.Frame(parent, padding=(8, 4))
+        self._duped_near_tools = near_tools
+        ttk.Label(near_tools, text='Max Hamming:').pack(side='left')
+        self.duped_hamming_var = tk.IntVar(value=DEFAULT_MAX_HAMMING)
+        ttk.Spinbox(
+            near_tools,
+            from_=0,
+            to=16,
+            width=4,
+            textvariable=self.duped_hamming_var,
+        ).pack(side='left', padx=4)
+        ttk.Button(
+            near_tools, text='Fill dHash', command=self.duped_fill_dhash
+        ).pack(side='left', padx=(8, 2))
+        ttk.Button(
+            near_tools, text='Rebuild near pairs', command=self.duped_rebuild_near
+        ).pack(side='left', padx=2)
+        ttk.Button(
+            near_tools,
+            text='Mark false positive',
+            command=self.duped_mark_false_positive,
+        ).pack(side='left', padx=(12, 2))
 
-        left = ttk.Frame(paned)
-        right = ttk.Frame(paned)
-        paned.add(left, weight=1)
-        paned.add(right, weight=2)
+        body = ttk.Panedwindow(parent, orient='vertical')
+        body.pack(fill='both', expand=True, padx=8, pady=8)
+        self._duped_body_paned = body
+
+        lists = ttk.Panedwindow(body, orient='horizontal')
+        body.add(lists, weight=3)
+
+        left = ttk.Frame(lists)
+        right = ttk.Frame(lists)
+        lists.add(left, weight=1)
+        lists.add(right, weight=2)
 
         gcols = ('gallery', 'shared', 'peers', 'folder')
         self.duped_gallery_tree = ttk.Treeview(
@@ -937,7 +1046,7 @@ class App(ttk.Frame):
             columns=gcols,
             show='headings',
             selectmode='browse',
-            height=14,
+            height=10,
         )
         self._duped_bind_sortable_headings(
             self.duped_gallery_tree,
@@ -974,15 +1083,16 @@ class App(ttk.Frame):
         ttk.Label(legend, text='  vs  ').pack(side='left')
         tk.Label(
             legend,
-            text='  Peer / other  ',
+            text='  Peer  ',
             fg='white',
             bg=DUPED_COLOR_RIGHT,
             font=('Segoe UI', 8, 'bold'),
         ).pack(side='left')
         ttk.Label(
             legend,
-            text='   focus = yellow · right-click → Explorer',
-        ).pack(side='left', padx=(8, 0))
+            text='  (hover \u00b13 \u00b7 double-click \u2192 large compare)',
+            foreground='#666666',
+        ).pack(side='left', padx=8)
 
         tree_wrap = ttk.Frame(right)
         tree_wrap.pack(fill='both', expand=True)
@@ -991,7 +1101,7 @@ class App(ttk.Frame):
             columns=fcols,
             show='headings',
             selectmode='extended',
-            height=14,
+            height=10,
         )
         self._duped_bind_sortable_headings(
             self.duped_file_tree,
@@ -1022,14 +1132,58 @@ class App(ttk.Frame):
         )
         self.duped_file_tree.bind('<MouseWheel>', lambda _e: self._duped_hide_preview())
         self.duped_file_tree.bind('<Button-3>', self._on_duped_file_context)
+        self.duped_file_tree.bind('<<TreeviewSelect>>', self._on_duped_file_select)
+        self.duped_file_tree.bind('<Double-1>', self._on_duped_file_double)
         self._duped_file_menu = tk.Menu(self, tearoff=0)
-        # Click fallback if <<TreeviewSelect>> is flaky after reloads.
         self.duped_gallery_tree.bind('<ButtonRelease-1>', self._on_duped_gallery_click)
+
+        compare = ttk.LabelFrame(
+            body,
+            text='Match board (index · double-click / Compare \u2192 large window)',
+            padding=4,
+        )
+        body.add(compare, weight=3)
+        self._duped_compare_frame = compare
+
+        board_wrap = ttk.Frame(compare)
+        board_wrap.pack(fill='both', expand=True)
+        canvas = tk.Canvas(board_wrap, highlightthickness=0, bg='#1e1e1e')
+        vscroll = ttk.Scrollbar(board_wrap, orient='vertical', command=canvas.yview)
+        canvas.configure(yscrollcommand=vscroll.set)
+        vscroll.pack(side='right', fill='y')
+        canvas.pack(side='left', fill='both', expand=True)
+        inner = ttk.Frame(canvas)
+        self._duped_board_window = canvas.create_window((0, 0), window=inner, anchor='nw')
+        self._duped_board_canvas = canvas
+        self._duped_compare_inner = inner
+
+        def _on_inner_configure(_event=None):
+            canvas.configure(scrollregion=canvas.bbox('all'))
+
+        def _on_canvas_configure(event):
+            canvas.itemconfigure(self._duped_board_window, width=event.width)
+
+        def _on_board_scroll(event):
+            if event.delta:
+                canvas.yview_scroll(int(-event.delta / 120), 'units')
+            self._duped_board_maybe_load_more()
+
+        inner.bind('<Configure>', _on_inner_configure)
+        canvas.bind('<Configure>', _on_canvas_configure)
+        canvas.bind('<MouseWheel>', _on_board_scroll)
+        inner.bind('<MouseWheel>', _on_board_scroll)
+
+        ttk.Label(
+            inner,
+            text='Select a gallery — match cards appear here (no click-per-row needed).',
+            foreground='#888888',
+        ).pack(anchor='w', padx=4, pady=8)
 
         self.duped_status = tk.StringVar(
             value='Refresh to list galleries with shared fingerprints.'
         )
         ttk.Label(parent, textvariable=self.duped_status, padding=(8, 4)).pack(fill='x')
+        self._duped_apply_mode_ui()
 
     def _request_reload(self):
         shell = self.winfo_toplevel()
@@ -1039,10 +1193,17 @@ class App(ttk.Frame):
     def prepare_for_reload(self):
         """Stop workers before the shell destroys this frame (WishAssistance-style)."""
         self._lifecycle_alive = False
+        self._ui_drain_alive = False
+        self._duped_file_pop_gen += 1
         self._stop.set()
         self._import_stop.set()
         self._duped_stop.set()
         self._duped_hide_preview()
+        self._duped_close_compare_win()
+        with self._ui_pending_lock:
+            self._ui_pending.clear()
+        with self._duped_thumb_ready_lock:
+            self._duped_thumb_ready.clear()
         hw = self._hash_worker
         self._hash_worker = None
         if hw:
@@ -1050,6 +1211,18 @@ class App(ttk.Frame):
                 hw.stop(join_timeout=1.0)
             except Exception:
                 pass
+        dw = self._dhash_worker
+        self._dhash_worker = None
+        if dw:
+            try:
+                dw.stop(join_timeout=1.0)
+            except Exception:
+                pass
+        try:
+            self._duped_thumb_gen += 1
+            self._duped_thumb_queue.put_nowait(None)
+        except Exception:
+            pass
         if self._current_url and self.store:
             try:
                 self.store.mark_stopped(self._current_url)
@@ -1061,6 +1234,78 @@ class App(ttk.Frame):
         self._worker = None
         self._current_url = None
         log.info('prepare_for_reload: workers stopped')
+
+    def _start_ui_drain(self):
+        """Periodic UI drain — only the main thread may call Tk/after."""
+        self._ui_drain_alive = True
+        try:
+            self.after(UI_DRAIN_MS, self._drain_ui_pending)
+        except tk.TclError:
+            self._ui_drain_alive = False
+
+    def _ui_schedule(self, fn, *args):
+        """Enqueue UI work from any thread (no Tk calls here)."""
+        if not self._lifecycle_alive or not self._ui_drain_alive:
+            return
+        with self._ui_pending_lock:
+            self._ui_pending.append((fn, args))
+
+    def _drain_ui_pending(self):
+        if not self._ui_drain_alive or not self._lifecycle_alive:
+            return
+        try:
+            if not self.winfo_exists():
+                return
+        except tk.TclError:
+            return
+
+        self._drain_duped_thumb_ready()
+
+        batch: list[tuple[object, tuple]] = []
+        with self._ui_pending_lock:
+            while self._ui_pending and len(batch) < UI_DRAIN_BATCH:
+                batch.append(self._ui_pending.popleft())
+        for fn, args in batch:
+            if not self._lifecycle_alive:
+                break
+            try:
+                fn(*args)
+            except tk.TclError:
+                pass
+            except Exception:
+                log.exception('UI drain callback failed')
+
+        if not self._ui_drain_alive or not self._lifecycle_alive:
+            return
+        try:
+            self.after(UI_DRAIN_MS, self._drain_ui_pending)
+        except tk.TclError:
+            self._ui_drain_alive = False
+
+    def _drain_duped_thumb_ready(self):
+        """Apply a bounded number of decoded thumbs per tick (main thread only)."""
+        jobs = []
+        with self._duped_thumb_ready_lock:
+            while self._duped_thumb_ready and len(jobs) < DUPED_THUMB_APPLY_PER_TICK:
+                jobs.append(self._duped_thumb_ready.popleft())
+        for gen, lbl, image, key in jobs:
+            if gen != self._duped_thumb_gen or not self._lifecycle_alive:
+                continue
+            try:
+                from PIL import ImageTk
+
+                photo = ImageTk.PhotoImage(image)
+            except Exception:
+                continue
+            self._duped_thumb_cache[key] = photo
+            self._duped_compare_photos.append(photo)
+            if self._duped_compare_win is not None:
+                self._duped_compare_win_photos.append(photo)
+            try:
+                if lbl.winfo_exists():
+                    lbl.configure(image=photo, text='')
+            except Exception:
+                pass
 
     # --- Duped tab ---
 
@@ -1096,7 +1341,7 @@ class App(ttk.Frame):
         else:
             tree = self.duped_file_tree
             prev_col, prev_rev = self._duped_file_sort
-            numeric_cols = set()
+            numeric_cols = {'home'}  # Home gallery key or Near Hamming dist
 
         reverse = not prev_rev if col == prev_col else False
         if which == 'gallery':
@@ -1291,12 +1536,13 @@ class App(ttk.Frame):
                         'path': self._duped_slot_path(
                             folder, name, a.get('sample_path')
                         ),
+                        'sha1': a.get('sha1'),
                     }
                 )
         elif folder is not None:
             # No aliases yet — disk order only.
             for pth in sorted(list_images(folder), key=lambda x: nat_key(x.name)):
-                slots.append({'name': pth.name, 'path': pth})
+                slots.append({'name': pth.name, 'path': pth, 'sha1': None})
         self._duped_seq_cache[gallery_key] = slots
         return slots
 
@@ -1554,26 +1800,138 @@ class App(ttk.Frame):
         finally:
             menu.grab_release()
 
-    def _duped_load_thumb(self, path: Path | None, size: int = DUPED_THUMB_SIZE):
-        """Return PhotoImage or None."""
+    def _duped_load_thumb(
+        self,
+        path: Path | None,
+        size: int = DUPED_THUMB_SIZE,
+        *,
+        box: tuple[int, int] | None = None,
+        fast: bool = False,
+    ):
+        """Return PhotoImage or None (sync — prefer ``_duped_queue_thumb`` for board)."""
+        img = self._duped_decode_thumb_image(path, size=size, box=box, fast=fast)
+        if img is None:
+            return None
+        try:
+            from PIL import ImageTk
+
+            return ImageTk.PhotoImage(img)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _duped_decode_thumb_image(
+        path: Path | None,
+        *,
+        size: int = DUPED_THUMB_SIZE,
+        box: tuple[int, int] | None = None,
+        fast: bool = False,
+    ):
+        """Decode to a PIL RGB image (thread-safe)."""
         if path is None:
             return None
         try:
-            from PIL import Image, ImageTk
+            from PIL import Image
         except ImportError:
             return None
         try:
             with Image.open(path) as im:
+                if box is not None:
+                    bw, bh = int(box[0]), int(box[1])
+                    if fast:
+                        try:
+                            im.draft('RGB', (bw, bh))
+                        except Exception:
+                            pass
+                    if im.mode != 'RGB':
+                        im = im.convert('RGB')
+                    else:
+                        im = im.copy()
+                    resample = (
+                        Image.Resampling.BILINEAR if fast else Image.Resampling.LANCZOS
+                    )
+                    im.thumbnail((bw, bh), resample)
+                    canvas = Image.new('RGB', (bw, bh), (32, 32, 32))
+                    canvas.paste(
+                        im, ((bw - im.width) // 2, (bh - im.height) // 2)
+                    )
+                    return canvas
+                if fast:
+                    try:
+                        im.draft('RGB', (size, size))
+                    except Exception:
+                        pass
                 if im.mode != 'RGB':
                     im = im.convert('RGB')
-                im.thumbnail((size, size), Image.Resampling.LANCZOS)
+                else:
+                    im = im.copy()
+                resample = (
+                    Image.Resampling.BILINEAR if fast else Image.Resampling.LANCZOS
+                )
+                im.thumbnail((size, size), resample)
                 canvas = Image.new('RGB', (size, size), (40, 40, 40))
-                ox = (size - im.width) // 2
-                oy = (size - im.height) // 2
-                canvas.paste(im, (ox, oy))
-                return ImageTk.PhotoImage(canvas)
+                canvas.paste(
+                    im, ((size - im.width) // 2, (size - im.height) // 2)
+                )
+                return canvas
         except Exception:
             return None
+
+    def _duped_ensure_thumb_worker(self):
+        t = self._duped_thumb_thread
+        if t is not None and t.is_alive():
+            return
+
+        def run():
+            while True:
+                job = self._duped_thumb_queue.get()
+                if job is None:
+                    break
+                gen, label, path, box, cache_key, fast = job
+                if gen != self._duped_thumb_gen or not self._lifecycle_alive:
+                    continue
+                img = self._duped_decode_thumb_image(
+                    path, box=box, fast=fast
+                )
+                if img is None:
+                    continue
+                if gen != self._duped_thumb_gen or not self._lifecycle_alive:
+                    continue
+                with self._duped_thumb_ready_lock:
+                    while len(self._duped_thumb_ready) >= DUPED_THUMB_READY_MAX:
+                        self._duped_thumb_ready.popleft()
+                    self._duped_thumb_ready.append((gen, label, img, cache_key))
+
+        self._duped_thumb_thread = threading.Thread(
+            target=run, name='duped-thumbs', daemon=True
+        )
+        self._duped_thumb_thread.start()
+
+    def _duped_queue_thumb(
+        self,
+        label: tk.Label,
+        path: Path | None,
+        box: tuple[int, int],
+        *,
+        fast: bool = True,
+    ) -> None:
+        """Show cached thumb or queue async decode (keeps UI responsive)."""
+        if path is None:
+            return
+        cache_key = f'{path}|{box[0]}x{box[1]}|{"f" if fast else "q"}'
+        cached = self._duped_thumb_cache.get(cache_key)
+        if cached is not None:
+            try:
+                label.configure(image=cached, text='')
+                if self._duped_compare_win is not None:
+                    self._duped_compare_win_photos.append(cached)
+            except Exception:
+                pass
+            return
+        self._duped_ensure_thumb_worker()
+        self._duped_thumb_queue.put(
+            (self._duped_thumb_gen, label, path, box, cache_key, fast)
+        )
 
     def _duped_build_strip(
         self,
@@ -1627,7 +1985,7 @@ class App(ttk.Frame):
                 highlightthickness=thick,
             )
             cell.pack(padx=6, pady=2)
-            photo = self._duped_load_thumb(path)
+            photo = self._duped_load_thumb(path, fast=True)
             if photo is not None:
                 self._duped_preview_photos.append(photo)
                 tk.Label(cell, image=photo, bg='#111').pack()
@@ -1776,7 +2134,106 @@ class App(ttk.Frame):
             pass
         self._duped_hide_preview()
 
-    def duped_refresh(self):
+    def _duped_is_near(self) -> bool:
+        return (getattr(self, 'duped_mode_var', None) and
+                self.duped_mode_var.get() == 'near') or self._duped_mode == 'near'
+
+    def _on_duped_mode_change(self):
+        self._duped_mode = self.duped_mode_var.get()
+        self._duped_apply_mode_ui()
+        self.duped_refresh()
+
+    def _duped_apply_mode_ui(self):
+        near = self._duped_is_near()
+        if near:
+            self._duped_exact_tools.pack_forget()
+            self._duped_near_tools.pack(fill='x')
+            try:
+                self.duped_undecided_chk.state(['disabled'])
+            except Exception:
+                pass
+            labels = {
+                'name': 'This name',
+                'this_path': 'This path',
+                'peer': 'Peer name',
+                'peer_path': 'Peer path',
+                'home': 'Dist',
+            }
+        else:
+            self._duped_near_tools.pack_forget()
+            self._duped_exact_tools.pack(fill='x')
+            try:
+                self.duped_undecided_chk.state(['!disabled'])
+            except Exception:
+                pass
+            labels = {
+                'name': 'This name',
+                'this_path': 'This path',
+                'peer': 'Peer name',
+                'peer_path': 'Peer path',
+                'home': 'Home',
+            }
+        self._duped_bind_sortable_headings(
+            self.duped_file_tree, labels, which='file'
+        )
+
+    def _start_dhash_worker(self):
+        if not self.store or self._dhash_worker is not None:
+            return
+
+        def on_progress(msg: str):
+            if not self._lifecycle_alive:
+                return
+
+            def apply():
+                if not self._lifecycle_alive:
+                    return
+                if self._duped_is_near():
+                    self.duped_status.set(msg)
+
+            self._ui_schedule(apply)
+
+        try:
+            ham = int(self.duped_hamming_var.get()) if hasattr(self, 'duped_hamming_var') else DEFAULT_MAX_HAMMING
+        except Exception:
+            ham = DEFAULT_MAX_HAMMING
+        worker = DhashFillWorker(
+            self.store,
+            max_hamming=ham,
+            on_progress=on_progress,
+            enabled=True,
+        )
+        self._dhash_worker = worker
+        worker.start()
+
+    def duped_fill_dhash(self):
+        if not self.store:
+            return
+        w = self._dhash_worker
+        if w is None:
+            self._start_dhash_worker()
+            w = self._dhash_worker
+        if w is None:
+            return
+        try:
+            w.set_max_hamming(int(self.duped_hamming_var.get()))
+        except Exception:
+            pass
+        w.set_enabled(True)
+        w.wake()
+        try:
+            stats = self.store.dhash_fill_stats()
+        except Exception as e:
+            messagebox.showerror('Duped', f'dHash stats failed:\n{e}')
+            return
+        skip = stats.get('failed') or 0
+        skip_s = f', {skip} unreadable' if skip else ''
+        self.duped_status.set(
+            f"Filling dHash — {stats['filled']}/{stats['total']} "
+            f"({stats['missing']} left{skip_s})"
+        )
+
+    def duped_rebuild_near(self):
         if not self.store:
             messagebox.showwarning('Duped', 'Database not ready.')
             return
@@ -1784,16 +2241,874 @@ class App(ttk.Frame):
             messagebox.showinfo('Duped', 'Busy — wait for the current job.')
             return
         try:
-            rows = self.store.list_dupe_galleries(
-                limit=500,
-                undecided_only=bool(self.duped_undecided_var.get()),
+            ham = int(self.duped_hamming_var.get())
+        except Exception:
+            ham = DEFAULT_MAX_HAMMING
+        if not messagebox.askyesno(
+            'Duped',
+            f'Rebuild near pairs from all filled dHashes?\n'
+            f'Max Hamming = {ham}\n\n'
+            f'This runs in the background (BK-tree over all fingerprints).',
+        ):
+            return
+        self._duped_busy = True
+        self.duped_status.set('Rebuilding near pairs…')
+
+        def work():
+            err = None
+            stats = {}
+            try:
+                w = self._dhash_worker
+                if w is not None:
+                    w.set_max_hamming(ham)
+                    stats = w.full_rebuild_pairs()
+                else:
+                    stats = self.store.rebuild_dhash_near_pairs(max_hamming=ham)
+            except Exception as e:
+                err = e
+
+            def done():
+                self._duped_busy = False
+                if not self._lifecycle_alive:
+                    return
+                if err:
+                    messagebox.showerror('Duped', f'Rebuild failed:\n{err}')
+                    self.duped_status.set('Near rebuild failed')
+                    return
+                self.duped_status.set(
+                    f"Near pairs rebuilt — {stats.get('pairs', 0)} pair(s) "
+                    f"from {stats.get('fingerprints', stats.get('tree', 0))} dHash(es)"
+                )
+                log_feed(
+                    log,
+                    logging.INFO,
+                    'dHash near rebuild pairs=%s fps=%s ham=%s',
+                    stats.get('pairs'),
+                    stats.get('fingerprints', stats.get('tree')),
+                    ham,
+                )
+                if self._duped_is_near():
+                    self.duped_refresh()
+
+            self._ui_schedule(done)
+
+        threading.Thread(target=work, name='dhash-rebuild', daemon=True).start()
+
+    def duped_mark_false_positive(self):
+        if not self.store:
+            return
+        sel = list(self.duped_file_tree.selection())
+        if not sel:
+            messagebox.showinfo('Duped', 'Select one or more near-match rows.')
+            return
+        items = [self._duped_files[i] for i in sel if i in self._duped_files]
+        near_items = [it for it in items if it.get('peer_sha1') or it.get('match_kind') == 'near']
+        if not near_items:
+            messagebox.showinfo(
+                'Duped',
+                'False positives apply to Near dHash matches.\n'
+                'Switch to Near dHash and select rows.',
             )
+            return
+        if not messagebox.askyesno(
+            'Duped',
+            f'Mark {len(near_items)} pair(s) as false positive?\n'
+            'They will not reappear after rebuild.',
+        ):
+            return
+        n = 0
+        for it in near_items:
+            peer = it.get('peer_sha1')
+            local = it.get('sha1')
+            if not peer or not local:
+                continue
+            try:
+                self.store.mark_dhash_false_positive(local, peer)
+                n += 1
+            except Exception as e:
+                self.ui_log(f'FP mark failed: {e}')
+        self.duped_status.set(f'Marked {n} false positive(s)')
+        log_feed(log, logging.INFO, 'dHash false positives marked: %s', n)
+        self.duped_refresh()
+
+    def _on_duped_file_select(self, _event=None):
+        """Sync board scroll to the selected tree row (board already shows all)."""
+        if not self._lifecycle_alive:
+            return
+        sel = list(self.duped_file_tree.selection())
+        if not sel:
+            return
+        iid = sel[0]
+        # Cards are tagged with iid as widget name prefix card_<iid>
+        inner = getattr(self, '_duped_compare_inner', None)
+        canvas = getattr(self, '_duped_board_canvas', None)
+        if inner is None or canvas is None:
+            return
+        for child in inner.winfo_children():
+            if str(child).endswith(iid) or getattr(child, '_duped_iid', None) == iid:
+                try:
+                    canvas.yview_moveto(
+                        max(0.0, child.winfo_y() / max(1, inner.winfo_height()))
+                    )
+                except Exception:
+                    pass
+                break
+
+    def _duped_clear_compare(self):
+        # Always tear down compare win; FP/Link set reopen flag to bring it back.
+        self._duped_close_compare_win()
+        inner = getattr(self, '_duped_compare_inner', None)
+        if inner is None:
+            return
+        self._duped_thumb_gen += 1
+        try:
+            while True:
+                self._duped_thumb_queue.get_nowait()
+        except queue.Empty:
+            pass
+        with self._duped_thumb_ready_lock:
+            self._duped_thumb_ready.clear()
+        for child in inner.winfo_children():
+            child.destroy()
+        self._duped_compare_photos = []
+        self._duped_board_items = []
+        self._duped_board_loaded = 0
+        self._duped_board_loading = False
+        if len(self._duped_thumb_cache) > 4000:
+            self._duped_thumb_cache.clear()
+
+    def _duped_pair_linked(self, a: bytes | None, b: bytes | None) -> bool:
+        if not a or not b:
+            return False
+        if a == b:
+            return True
+        from image_dhash import order_sha_pair
+
+        key = order_sha_pair(a, b)
+        return key in self._duped_linked_pairs
+
+    def _duped_rebuild_board(self, files: list[dict]):
+        """Fill the scrollable match board (lazy + async thumbs)."""
+        self._duped_clear_compare()
+        inner = self._duped_compare_inner
+        focus_key = self._duped_focus_key
+        if not focus_key:
+            ttk.Label(inner, text='Select a gallery.', foreground='#888').pack(
+                anchor='w', padx=4, pady=8
+            )
+            return
+        if not files:
+            ttk.Label(
+                inner, text='No matches listed for this gallery.', foreground='#888'
+            ).pack(anchor='w', padx=4, pady=8)
+            return
+        try:
+            self._duped_linked_pairs = (
+                self.store.load_linked_sha_pairs() if self.store else set()
+            )
+        except Exception:
+            self._duped_linked_pairs = set()
+        try:
+            self._duped_sequence(focus_key)
+        except Exception:
+            pass
+        peer_warm: set[str] = set()
+        for it in files[:40]:
+            pk = self._duped_peer_key(it, focus_key)
+            if pk and pk not in peer_warm:
+                peer_warm.add(pk)
+                try:
+                    self._duped_sequence(pk)
+                except Exception:
+                    pass
+                if len(peer_warm) >= 6:
+                    break
+        self._duped_board_items = list(files)
+        self._duped_board_loaded = 0
+        ttk.Label(
+            inner,
+            text=f'Loading match board… 0/{len(files)} (thumbs async)',
+            foreground='#888888',
+        ).pack(anchor='w', padx=4, pady=4)
+        self._ui_schedule(self._duped_board_fill_viewport)
+        self._ui_schedule(self._duped_maybe_reopen_compare)
+        self.after(1, self._duped_board_load_more)
+
+    def _duped_board_maybe_load_more(self):
+        canvas = self._duped_board_canvas
+        if canvas is None or self._duped_board_loading:
+            return
+        try:
+            _top, bottom = canvas.yview()
+        except Exception:
+            return
+        if bottom >= 0.85:
+            self._duped_board_load_more()
+
+    def _duped_board_fill_viewport(self):
+        if not self._lifecycle_alive or self._duped_board_loading:
+            return
+        if self._duped_board_loaded >= len(self._duped_board_items):
+            return
+        canvas = self._duped_board_canvas
+        if canvas is None:
+            return
+        try:
+            bbox = canvas.bbox('all')
+            if bbox is None:
+                self._duped_board_load_more()
+                return
+            if bbox[3] < max(120, canvas.winfo_height() - 8):
+                self._duped_board_load_more()
+        except Exception:
+            pass
+
+    def _duped_board_load_more(self):
+        if not self._lifecycle_alive or self._duped_board_loading:
+            return
+        items = self._duped_board_items
+        start = self._duped_board_loaded
+        if start >= len(items):
+            return
+        self._duped_board_loading = True
+        end = min(len(items), start + DUPED_BOARD_BATCH)
+        inner = self._duped_compare_inner
+        for child in list(inner.winfo_children()):
+            if isinstance(child, ttk.Label):
+                txt = str(child.cget('text') or '')
+                if txt.startswith('Loading match board'):
+                    child.destroy()
+        try:
+            for i in range(start, end):
+                self._duped_append_match_card(inner, items[i], index=i)
+            self._duped_board_loaded = end
+        finally:
+            self._duped_board_loading = False
+        canvas = self._duped_board_canvas
+        if canvas is not None:
+            try:
+                canvas.configure(scrollregion=canvas.bbox('all'))
+            except Exception:
+                pass
+        if end < len(items):
+            self.after(20, self._duped_board_fill_viewport)
+        else:
+            self.duped_status.set(
+                f'{self._duped_focus_key}: board complete ({end} cards)'
+            )
+
+    def _duped_close_compare_win(self) -> None:
+        win = self._duped_compare_win
+        self._duped_compare_win = None
+        self._duped_cw_widgets = {}
+        self._duped_compare_win_photos = []
+        if win is not None:
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+    def _duped_maybe_reopen_compare(self) -> None:
+        idx = self._duped_compare_reopen_after_refresh
+        self._duped_compare_reopen_after_refresh = None
+        if idx is None or not self._lifecycle_alive:
+            return
+        items = self._duped_board_items
+        if not items:
+            return
+        self._duped_open_compare(min(max(0, idx), len(items) - 1))
+
+    def _on_duped_file_double(self, _event=None):
+        sel = list(self.duped_file_tree.selection())
+        if not sel:
+            return
+        iid = sel[0]
+        for i, it in enumerate(self._duped_board_items or self._duped_files):
+            if (it.get('sha1_hex') or '') == iid:
+                self._duped_open_compare(i)
+                return
+        # Fallback: files list before board finished
+        for i, it in enumerate(self._duped_files):
+            if (it.get('sha1_hex') or '') == iid:
+                if not self._duped_board_items:
+                    self._duped_board_items = list(self._duped_files)
+                self._duped_open_compare(i)
+                return
+
+    def _duped_open_compare(self, index: int) -> None:
+        items = self._duped_board_items
+        if not items:
+            return
+        index = max(0, min(int(index), len(items) - 1))
+        self._duped_compare_idx = index
+        win = self._duped_compare_win
+        if win is None or not win.winfo_exists():
+            self._duped_build_compare_win()
+            win = self._duped_compare_win
+        if win is None:
+            return
+        try:
+            win.deiconify()
+            win.lift()
+            win.focus_force()
+        except Exception:
+            pass
+        self._duped_compare_show(index)
+
+    def _duped_build_compare_win(self) -> None:
+        self._duped_close_compare_win()
+        win = tk.Toplevel(self)
+        win.title('Duped compare')
+        win.configure(background='#1e1e1e')
+        try:
+            win.geometry('1100x820')
+            win.minsize(720, 520)
+        except Exception:
+            pass
+        win.protocol('WM_DELETE_WINDOW', self._duped_close_compare_win)
+        win.bind('<Escape>', lambda _e: self._duped_close_compare_win())
+        win.bind('<Left>', lambda _e: self._duped_compare_nav(-1))
+        win.bind('<Right>', lambda _e: self._duped_compare_nav(1))
+        win.bind('<Prior>', lambda _e: self._duped_compare_nav(-1))
+        win.bind('<Next>', lambda _e: self._duped_compare_nav(1))
+
+        root = tk.Frame(win, bg='#1e1e1e', padx=8, pady=8)
+        root.pack(fill='both', expand=True)
+
+        title = tk.Label(
+            root, text='', fg='#eee', bg='#1e1e1e', font=('Segoe UI', 11, 'bold')
+        )
+        title.pack(anchor='w')
+        meta = tk.Label(
+            root, text='', fg='#aaa', bg='#1e1e1e', font=('Segoe UI', 9), justify='left'
+        )
+        meta.pack(anchor='w', pady=(2, 6))
+
+        nav = tk.Frame(root, bg='#1e1e1e')
+        nav.pack(fill='x', pady=(0, 6))
+        ttk.Button(nav, text='← Prev', width=10, command=lambda: self._duped_compare_nav(-1)).pack(
+            side='left', padx=2
+        )
+        ttk.Button(nav, text='Next →', width=10, command=lambda: self._duped_compare_nav(1)).pack(
+            side='left', padx=2
+        )
+        ttk.Button(
+            nav, text='False positive', width=14, command=self._duped_compare_fp
+        ).pack(side='left', padx=(16, 2))
+        tk.Label(
+            nav,
+            text='←/→ navigate · Esc close',
+            fg='#666',
+            bg='#1e1e1e',
+            font=('Segoe UI', 8),
+        ).pack(side='right')
+
+        panes = tk.Frame(root, bg='#1e1e1e')
+        panes.pack(fill='both', expand=True)
+
+        left_col = tk.Frame(
+            panes,
+            bg='#111',
+            highlightbackground=DUPED_COLOR_LEFT,
+            highlightthickness=3,
+        )
+        left_col.pack(side='left', fill='both', expand=True, padx=(0, 4))
+        left_name = tk.Label(
+            left_col,
+            text='',
+            fg=DUPED_COLOR_LEFT,
+            bg='#111',
+            font=('Segoe UI', 9, 'bold'),
+            wraplength=500,
+            justify='left',
+        )
+        left_name.pack(anchor='w', padx=6, pady=4)
+        left_img = tk.Label(left_col, text='…', fg='#888', bg='#111')
+        left_img.pack(fill='both', expand=True, padx=6, pady=6)
+
+        right_col = tk.Frame(
+            panes,
+            bg='#111',
+            highlightbackground=DUPED_COLOR_RIGHT,
+            highlightthickness=3,
+        )
+        right_col.pack(side='left', fill='both', expand=True, padx=(4, 0))
+        right_name = tk.Label(
+            right_col,
+            text='',
+            fg=DUPED_COLOR_RIGHT,
+            bg='#111',
+            font=('Segoe UI', 9, 'bold'),
+            wraplength=500,
+            justify='left',
+        )
+        right_name.pack(anchor='w', padx=6, pady=4)
+        right_img = tk.Label(right_col, text='…', fg='#888', bg='#111')
+        right_img.pack(fill='both', expand=True, padx=6, pady=6)
+
+        link_row = tk.Frame(root, bg='#1e1e1e')
+        link_row.pack(fill='x', pady=(8, 0))
+        tk.Label(
+            link_row,
+            text='Link neighbors:',
+            fg='#888',
+            bg='#1e1e1e',
+            font=('Segoe UI', 8),
+        ).pack(side='left')
+
+        self._duped_compare_win = win
+        self._duped_cw_widgets = {
+            'title': title,
+            'meta': meta,
+            'left_name': left_name,
+            'right_name': right_name,
+            'left_img': left_img,
+            'right_img': right_img,
+            'link_row': link_row,
+        }
+        self._duped_compare_win_photos = []
+
+    def _duped_compare_nav(self, delta: int) -> None:
+        items = self._duped_board_items
+        if not items:
+            return
+        self._duped_open_compare(self._duped_compare_idx + int(delta))
+
+    def _duped_compare_fp(self) -> None:
+        items = self._duped_board_items
+        if not items:
+            return
+        idx = self._duped_compare_idx
+        if 0 <= idx < len(items):
+            self._duped_fp_one(items[idx])
+
+    def _duped_compare_show(self, index: int) -> None:
+        items = self._duped_board_items
+        w = self._duped_cw_widgets
+        if not items or not w or self._duped_compare_win is None:
+            return
+        index = max(0, min(index, len(items) - 1))
+        self._duped_compare_idx = index
+        item = items[index]
+        focus_key = self._duped_focus_key or ''
+        peer_key = self._duped_peer_key(item, focus_key)
+        left_seq = self._duped_sequence(focus_key) if focus_key else []
+        left_idx = self._duped_index_in_seq(left_seq, item, focus_key) if focus_key else None
+        right_seq: list[dict] = []
+        right_idx = None
+        if peer_key:
+            right_seq = self._duped_sequence(peer_key)
+            right_idx = self._duped_index_in_seq(right_seq, item, peer_key)
+
+        ham = item.get('hamming')
+        kind = item.get('match_kind') or 'exact'
+        if kind == 'manual' or ham == DUPED_MANUAL_HAMMING:
+            dist_txt = 'manual link'
+        elif ham is not None:
+            dist_txt = f'Hamming {ham}'
+        else:
+            dist_txt = 'exact SHA'
+
+        left_slot = left_seq[left_idx] if left_idx is not None and left_seq else {}
+        right_slot = (
+            right_seq[right_idx] if right_idx is not None and right_seq else {}
+        )
+        left_name = left_slot.get('name') or self._duped_alias_name(item, focus_key) or '?'
+        right_name = (
+            right_slot.get('name')
+            or (self._duped_alias_name(item, peer_key) if peer_key else '')
+            or '?'
+        )
+        left_path = left_slot.get('path')
+        right_path = right_slot.get('path')
+
+        try:
+            w['title'].configure(
+                text=f'#{index + 1} / {len(items)}  ·  {dist_txt}  ·  '
+                f'{focus_key} ↔ {peer_key or "?"}'
+            )
+            w['meta'].configure(
+                text=f'This: {left_path or "(missing)"}\nPeer: {right_path or "(missing)"}'
+            )
+            w['left_name'].configure(text=f'{focus_key}\n{left_name}')
+            w['right_name'].configure(
+                text=f'{peer_key or "?"}\n{right_name}' if peer_key else '(no peer)'
+            )
+            w['left_img'].configure(image='', text='…' if left_path else 'missing')
+            w['right_img'].configure(image='', text='…' if right_path else 'missing')
+        except Exception:
+            return
+
+        self._duped_compare_win_photos = []
+        box = (DUPED_COMPARE_WIN_W, DUPED_COMPARE_WIN_H)
+        if left_path is not None:
+            self._duped_queue_thumb(w['left_img'], left_path, box, fast=False)
+        if right_path is not None:
+            self._duped_queue_thumb(w['right_img'], right_path, box, fast=False)
+
+        # Rebuild Link neighbor buttons
+        link_row = w['link_row']
+        for child in list(link_row.winfo_children()):
+            try:
+                child.destroy()
+            except Exception:
+                pass
+        tk.Label(
+            link_row,
+            text='Link neighbors:',
+            fg='#888',
+            bg='#1e1e1e',
+            font=('Segoe UI', 8),
+        ).pack(side='left')
+        if (
+            peer_key
+            and left_idx is not None
+            and right_idx is not None
+        ):
+            any_btn = False
+            for off in (-3, -2, -1, 1, 2, 3):
+                li = left_idx + off
+                ri = right_idx + off
+                if not (0 <= li < len(left_seq) and 0 <= ri < len(right_seq)):
+                    continue
+                sha_l = left_seq[li].get('sha1')
+                sha_r = right_seq[ri].get('sha1')
+                if not sha_l or not sha_r or sha_l == sha_r:
+                    continue
+                if self._duped_pair_linked(sha_l, sha_r):
+                    ttk.Label(link_row, text=f'{off:+d}✓').pack(side='left', padx=2)
+                    continue
+                any_btn = True
+                name_l = (left_seq[li].get('name') or '')[:24]
+                name_r = (right_seq[ri].get('name') or '')[:24]
+                ttk.Button(
+                    link_row,
+                    text=f'Link {off:+d}',
+                    width=9,
+                    command=lambda a=sha_l, b=sha_r, nl=name_l, nr=name_r: (
+                        self._duped_manual_link(a, b, nl, nr)
+                    ),
+                ).pack(side='left', padx=2)
+            if not any_btn:
+                tk.Label(
+                    link_row,
+                    text='all neighbor offsets linked or missing',
+                    fg='#666',
+                    bg='#1e1e1e',
+                    font=('Segoe UI', 8),
+                ).pack(side='left', padx=4)
+        else:
+            tk.Label(
+                link_row,
+                text='(need both sequences for Link)',
+                fg='#666',
+                bg='#1e1e1e',
+                font=('Segoe UI', 8),
+            ).pack(side='left', padx=4)
+
+        try:
+            self._duped_compare_win.title(
+                f'Duped compare — #{index + 1}/{len(items)} {dist_txt}'
+            )
+        except Exception:
+            pass
+
+    def _duped_append_match_card(self, parent, item: dict, *, index: int):
+        focus_key = self._duped_focus_key or ''
+        peer_key = self._duped_peer_key(item, focus_key)
+        left_seq = self._duped_sequence(focus_key)
+        left_idx = self._duped_index_in_seq(left_seq, item, focus_key)
+        right_seq: list[dict] = []
+        right_idx = None
+        if peer_key:
+            right_seq = self._duped_sequence(peer_key)
+            right_idx = self._duped_index_in_seq(right_seq, item, peer_key)
+
+        ham = item.get('hamming')
+        kind = item.get('match_kind') or 'exact'
+        if kind == 'manual' or ham == DUPED_MANUAL_HAMMING:
+            dist_txt = 'manual'
+        elif ham is not None:
+            dist_txt = f'Hamming {ham}'
+        else:
+            dist_txt = 'exact SHA'
+
+        card = tk.Frame(parent, bg='#252526', highlightbackground='#444', highlightthickness=1)
+        card.pack(fill='x', padx=4, pady=6)
+        card._duped_iid = item.get('sha1_hex') or ''  # type: ignore[attr-defined]
+        card._duped_board_index = index  # type: ignore[attr-defined]
+
+        head = tk.Frame(card, bg='#252526')
+        head.pack(fill='x', padx=6, pady=4)
+        tk.Label(
+            head,
+            text=f'#{index + 1}  {dist_txt}  ·  {focus_key} ↔ {peer_key or "?"}',
+            fg='#ccc',
+            bg='#252526',
+            font=('Segoe UI', 9, 'bold'),
+        ).pack(side='left')
+        ttk.Button(
+            head,
+            text='Compare',
+            width=10,
+            command=lambda i=index: self._duped_open_compare(i),
+        ).pack(side='right', padx=2)
+        if item.get('peer_sha1') or kind in ('near', 'manual'):
+            ttk.Button(
+                head,
+                text='False positive',
+                width=14,
+                command=lambda it=item: self._duped_fp_one(it),
+            ).pack(side='right', padx=2)
+
+        strips = tk.Frame(card, bg='#252526')
+        strips.pack(fill='x', padx=4, pady=2)
+        self._duped_build_board_strip(
+            strips,
+            gallery_key=focus_key,
+            seq=left_seq,
+            center_idx=left_idx,
+            border=DUPED_COLOR_LEFT,
+            title='This',
+            photo_bucket=self._duped_compare_photos,
+        )
+        if peer_key:
+            self._duped_build_board_strip(
+                strips,
+                gallery_key=peer_key,
+                seq=right_seq,
+                center_idx=right_idx,
+                border=DUPED_COLOR_RIGHT,
+                title='Peer',
+                photo_bucket=self._duped_compare_photos,
+            )
+        else:
+            tk.Label(
+                strips, text='(no peer)', fg='#888', bg='#252526'
+            ).pack(side='left', padx=12)
+
+        # Neighbor Link buttons for same relative offset when not already linked.
+        link_row = tk.Frame(card, bg='#252526')
+        link_row.pack(fill='x', padx=6, pady=(0, 6))
+        tk.Label(
+            link_row,
+            text='Link neighbors:',
+            fg='#888',
+            bg='#252526',
+            font=('Segoe UI', 8),
+        ).pack(side='left')
+        if (
+            peer_key
+            and left_idx is not None
+            and right_idx is not None
+        ):
+            any_btn = False
+            for off in (-3, -2, -1, 1, 2, 3):
+                li = left_idx + off
+                ri = right_idx + off
+                if not (0 <= li < len(left_seq) and 0 <= ri < len(right_seq)):
+                    continue
+                sha_l = left_seq[li].get('sha1')
+                sha_r = right_seq[ri].get('sha1')
+                if not sha_l or not sha_r or sha_l == sha_r:
+                    continue
+                if self._duped_pair_linked(sha_l, sha_r):
+                    ttk.Label(link_row, text=f'±{off}✓').pack(side='left', padx=2)
+                    continue
+                any_btn = True
+                name_l = (left_seq[li].get('name') or '')[:18]
+                name_r = (right_seq[ri].get('name') or '')[:18]
+                ttk.Button(
+                    link_row,
+                    text=f'Link {off:+d}',
+                    width=9,
+                    command=lambda a=sha_l, b=sha_r, nl=name_l, nr=name_r: (
+                        self._duped_manual_link(a, b, nl, nr)
+                    ),
+                ).pack(side='left', padx=2)
+            if not any_btn:
+                tk.Label(
+                    link_row,
+                    text='all neighbor offsets already linked or missing',
+                    fg='#666',
+                    bg='#252526',
+                    font=('Segoe UI', 8),
+                ).pack(side='left', padx=4)
+        else:
+            tk.Label(
+                link_row,
+                text='(need both sequences to suggest neighbor Links)',
+                fg='#666',
+                bg='#252526',
+                font=('Segoe UI', 8),
+            ).pack(side='left', padx=4)
+
+        # Bind wheel on card widgets
+        canvas = self._duped_board_canvas
+
+        def _wheel(event, c=canvas):
+            if c is None:
+                return
+            c.yview_scroll(int(-event.delta / 120), 'units')
+            self._duped_board_maybe_load_more()
+
+        for w in (card, head, strips, link_row):
+            w.bind('<MouseWheel>', _wheel)
+            w.bind('<Double-1>', lambda _e, i=index: self._duped_open_compare(i))
+
+        def _bind_dbl(widget, i=index):
+            widget.bind('<Double-1>', lambda _e, idx=i: self._duped_open_compare(idx))
+            for child in widget.winfo_children():
+                _bind_dbl(child)
+
+        _bind_dbl(strips)
+
+    def _duped_build_board_strip(
+        self,
+        parent,
+        *,
+        gallery_key: str,
+        seq: list[dict],
+        center_idx: int | None,
+        border: str,
+        title: str,
+        photo_bucket: list,
+    ) -> None:
+        """Horizontal strip of ±3 neighbors; thumbs load async."""
+        col = tk.Frame(
+            parent,
+            bg='#1a1a1a',
+            highlightbackground=border,
+            highlightthickness=2,
+        )
+        col.pack(side='left', padx=4, pady=2, fill='y')
+        tk.Label(
+            col,
+            text=f'{title}  {gallery_key}',
+            fg=border,
+            bg='#1a1a1a',
+            font=('Segoe UI', 8, 'bold'),
+        ).pack(pady=(2, 0))
+        if center_idx is None:
+            tk.Label(col, text='(no seq)', fg='#aaa', bg='#1a1a1a').pack(padx=6, pady=6)
+            return
+        row = tk.Frame(col, bg='#1a1a1a')
+        row.pack(padx=2, pady=2)
+        radius = DUPED_NEIGHBOR_RADIUS
+        start = max(0, center_idx - radius)
+        end = min(len(seq), center_idx + radius + 1)
+        box = (DUPED_BOARD_THUMB_W, DUPED_BOARD_THUMB_H)
+        for i in range(start, end):
+            slot = seq[i]
+            name = slot.get('name') or '?'
+            path = slot.get('path')
+            is_focus = i == center_idx
+            cell_border = DUPED_COLOR_FOCUS if is_focus else border
+            cell = tk.Frame(
+                row,
+                bg='#111',
+                highlightbackground=cell_border,
+                highlightthickness=3 if is_focus else 1,
+            )
+            cell.pack(side='left', padx=2, pady=2)
+            lbl = tk.Label(
+                cell,
+                text='…' if path is not None else 'miss',
+                width=8,
+                height=5,
+                fg='#888' if path is not None else '#f6ad55',
+                bg='#111',
+            )
+            lbl.pack()
+            if path is not None:
+                self._duped_queue_thumb(lbl, path, box)
+            tk.Label(
+                cell,
+                text=name[:16],
+                fg='#eee' if is_focus else '#999',
+                bg='#111',
+                font=('Segoe UI', 6, 'bold' if is_focus else 'normal'),
+            ).pack()
+
+    def _duped_fp_one(self, item: dict):
+        peer = item.get('peer_sha1')
+        local = item.get('sha1')
+        if not self.store or not peer or not local:
+            return
+        try:
+            self.store.mark_dhash_false_positive(local, peer)
+        except Exception as e:
+            messagebox.showerror('Duped', f'False positive failed:\n{e}')
+            return
+        log_feed(log, logging.INFO, 'dHash FP one %s', (item.get('sha1_hex') or '')[:10])
+        was_open = self._duped_compare_win is not None
+        stay = self._duped_compare_idx
+        if was_open:
+            self._duped_compare_reopen_after_refresh = stay
+        # Refresh list + board for current gallery
+        self._on_duped_gallery_select()
+
+    def _duped_manual_link(
+        self, sha_a: bytes, sha_b: bytes, name_a: str, name_b: str
+    ):
+        if not self.store:
+            return
+        if not messagebox.askyesno(
+            'Duped',
+            f'Manually link neighbors?\n\n{name_a}\n↔\n{name_b}\n\n'
+            'Stored as a near pair (source=manual). Survives Rebuild.',
+        ):
+            return
+        try:
+            self.store.add_manual_near_pair(sha_a, sha_b)
+        except Exception as e:
+            messagebox.showerror('Duped', f'Link failed:\n{e}')
+            return
+        from image_dhash import order_sha_pair
+
+        self._duped_linked_pairs.add(order_sha_pair(sha_a, sha_b))
+        self.duped_status.set(f'Linked {name_a} ↔ {name_b}')
+        log_feed(log, logging.INFO, 'manual near link %s ↔ %s', name_a, name_b)
+        was_open = self._duped_compare_win is not None
+        if was_open:
+            self._duped_compare_reopen_after_refresh = self._duped_compare_idx
+        # Soft refresh board so Link buttons update; keep gallery selection.
+        self._on_duped_gallery_select()
+
+    def _duped_show_compare(self, item: dict):
+        """Open large compare for this match item."""
+        hex_id = item.get('sha1_hex') or ''
+        for i, it in enumerate(self._duped_board_items or self._duped_files):
+            if (it.get('sha1_hex') or '') == hex_id or it is item:
+                self._duped_open_compare(i)
+                return
+        if item in (self._duped_files or []):
+            self._duped_board_items = list(self._duped_files)
+            self._duped_open_compare(self._duped_files.index(item))
+
+    def duped_refresh(self):
+        if not self.store:
+            messagebox.showwarning('Duped', 'Database not ready.')
+            return
+        if self._duped_busy:
+            messagebox.showinfo('Duped', 'Busy — wait for the current job.')
+            return
+        near = self._duped_is_near()
+        try:
+            if near:
+                rows = self.store.list_near_dupe_galleries(limit=500)
+            else:
+                rows = self.store.list_dupe_galleries(
+                    limit=500,
+                    undecided_only=bool(self.duped_undecided_var.get()),
+                )
         except Exception as e:
             messagebox.showerror('Duped', f'Query failed:\n{e}')
             return
         prev_sel = list(self.duped_gallery_tree.selection())
         self._duped_rows.clear()
         self._duped_seq_cache.clear()
+        self._duped_clear_compare()
         self.duped_gallery_tree.delete(*self.duped_gallery_tree.get_children())
         self.duped_file_tree.delete(*self.duped_file_tree.get_children())
         self._duped_files.clear()
@@ -1805,7 +3120,6 @@ class App(ttk.Frame):
             elif row.get('title'):
                 folder = (row['title'] or '')[:80]
             if not folder:
-                # Last resort: parent folder of any alias sample_path.
                 try:
                     names = self.store.list_gallery_ordered_names(key)
                 except Exception:
@@ -1821,7 +3135,7 @@ class App(ttk.Frame):
             iid = key
             self._duped_rows[iid] = row
             shared = row.get('undecided_count')
-            if shared is None or not self.duped_undecided_var.get():
+            if near or shared is None or not self.duped_undecided_var.get():
                 shared = row.get('shared_count') or 0
             self.duped_gallery_tree.insert(
                 '',
@@ -1834,16 +3148,30 @@ class App(ttk.Frame):
                     folder,
                 ),
             )
-        # Re-apply last sort (toggle off by faking same-col click state).
         col, rev = self._duped_gallery_sort
         self._duped_gallery_sort = (col, not rev)
         self._duped_sort_by('gallery', col)
-        mode = 'undecided' if self.duped_undecided_var.get() else 'all'
-        self.duped_status.set(
-            f'{len(rows)} gallery(ies) ({mode}) with shared files'
+        if near:
+            try:
+                stats = self.store.dhash_fill_stats()
+                fill = f" · dHash {stats['filled']}/{stats['total']}"
+            except Exception:
+                fill = ''
+            self.duped_status.set(
+                f'{len(rows)} gallery(ies) with near matches{fill}'
+            )
+        else:
+            mode = 'undecided' if self.duped_undecided_var.get() else 'all'
+            self.duped_status.set(
+                f'{len(rows)} gallery(ies) ({mode}) with shared files'
+            )
+        log_feed(
+            log,
+            logging.INFO,
+            'Duped refresh (%s): %s gallery(ies)',
+            'near' if near else 'exact',
+            len(rows),
         )
-        log_feed(log, logging.INFO, 'Duped refresh: %s gallery(ies)', len(rows))
-        # Restore selection if still present; else clear detail.
         if prev_sel and prev_sel[0] in self._duped_rows:
             self.duped_gallery_tree.selection_set(prev_sel[0])
             self.duped_gallery_tree.focus(prev_sel[0])
@@ -1855,17 +3183,23 @@ class App(ttk.Frame):
 
     def _on_duped_gallery_select(self, _event=None):
         self._duped_hide_preview()
+        self._duped_clear_compare()
+        self._duped_seq_cache.clear()
         sel = self.duped_gallery_tree.selection()
         if not sel or not self.store:
             return
         key = sel[0]
         self._duped_focus_key = key
+        near = self._duped_is_near()
         undecided = bool(self.duped_undecided_var.get())
         try:
-            files = self.store.list_shared_files_for_gallery(
-                key,
-                undecided_only=undecided,
-            )
+            if near:
+                files = self.store.list_near_files_for_gallery(key)
+            else:
+                files = self.store.list_shared_files_for_gallery(
+                    key,
+                    undecided_only=undecided,
+                )
         except Exception as e:
             log.exception('Duped detail failed for %s', key)
             self.ui_log(f'Duped detail failed: {e}')
@@ -1873,8 +3207,43 @@ class App(ttk.Frame):
             return
         try:
             self.duped_file_tree.delete(*self.duped_file_tree.get_children())
-            self._duped_files.clear()
-            for item in files:
+        except tk.TclError:
+            pass
+        self._duped_files.clear()
+        self._duped_file_pop_gen += 1
+        gen = self._duped_file_pop_gen
+        # Board first (lazy cards) so UI stays interactive while tree fills.
+        self._duped_rebuild_board(files)
+        if near:
+            self.duped_status.set(
+                f'{key}: loading {len(files)} near match(es)…'
+            )
+        else:
+            mode = 'undecided' if undecided else 'all'
+            self.duped_status.set(
+                f'{key}: loading {len(files)} shared ({mode})…'
+            )
+        log.info('Duped gallery %s → %s file(s)', key, len(files))
+        self._duped_populate_files_chunk(gen, key, near, undecided, files, 0)
+
+    def _duped_populate_files_chunk(
+        self,
+        gen: int,
+        key: str,
+        near: bool,
+        undecided: bool,
+        files: list[dict],
+        start: int,
+    ):
+        if (
+            gen != self._duped_file_pop_gen
+            or not self._lifecycle_alive
+            or key != self._duped_focus_key
+        ):
+            return
+        end = min(start + DUPED_TREE_CHUNK, len(files))
+        try:
+            for item in files[start:end]:
                 digest = item['sha1']
                 iid = digest.hex()
                 local_name = self._duped_alias_name(item, key)
@@ -1893,6 +3262,13 @@ class App(ttk.Frame):
                     if peer_key
                     else ''
                 )
+                if near:
+                    if item.get('match_kind') == 'manual' or item.get('hamming') == 255:
+                        home_col = 'manual'
+                    else:
+                        home_col = str(item.get('hamming', ''))
+                else:
+                    home_col = item.get('home_gallery_key') or ''
                 self._duped_files[iid] = item
                 self.duped_file_tree.insert(
                     '',
@@ -1903,22 +3279,33 @@ class App(ttk.Frame):
                         this_path,
                         peer_label,
                         peer_path,
-                        item.get('home_gallery_key') or '',
+                        home_col,
                     ),
                 )
-            col, rev = self._duped_file_sort
-            self._duped_file_sort = (col, not rev)
-            self._duped_sort_by('file', col)
         except Exception as e:
             log.exception('Duped file tree populate failed for %s', key)
             self.ui_log(f'Duped populate failed: {e}')
-            messagebox.showerror('Duped', f'Could not show files:\n{e}')
             return
-        mode = 'undecided' if undecided else 'all'
-        self.duped_status.set(
-            f'{key}: {len(files)} shared file(s) ({mode}) — hover for ±3 slice'
-        )
-        log.info('Duped gallery %s → %s file(s)', key, len(files))
+        if end < len(files):
+            self.after(
+                1,
+                lambda: self._duped_populate_files_chunk(
+                    gen, key, near, undecided, files, end
+                ),
+            )
+            return
+        col, rev = self._duped_file_sort
+        self._duped_file_sort = (col, not rev)
+        self._duped_sort_by('file', col)
+        if near:
+            self.duped_status.set(
+                f'{key}: {len(files)} near match(es) — double-click Compare window'
+            )
+        else:
+            mode = 'undecided' if undecided else 'all'
+            self.duped_status.set(
+                f'{key}: {len(files)} shared ({mode}) — board + hover ±3'
+            )
 
     def _duped_file_iids(self, *, scope: str) -> list[str]:
         """``scope`` is ``selected`` (tree selection) or ``all`` (all listed rows)."""
@@ -2024,7 +3411,7 @@ class App(ttk.Frame):
                     # Refresh lists so decided rows drop when filter is on.
                     self.duped_refresh()
 
-                self.after(0, done)
+                self._ui_schedule(done)
 
         threading.Thread(target=work, name='duped-apply', daemon=True).start()
 
@@ -2099,7 +3486,7 @@ class App(ttk.Frame):
                     self._duped_seq_cache.clear()
                     self.duped_refresh()
 
-                self.after(0, done)
+                self._ui_schedule(done)
 
         threading.Thread(target=work, name='duped-strip', daemon=True).start()
 
@@ -2171,10 +3558,12 @@ class App(ttk.Frame):
             raise FileNotFoundError('no on-disk copy for ' + digest.hex()[:12])
 
         dest = home_dir / home_name
-        if not same_path(real, dest):
-            moved = move_real_file(real, dest)
-        else:
+        # same_path() follows symlinks — a home-folder symlink to the real
+        # bytes must still be replaced. Compare directory entries, not targets.
+        if same_entry(real, dest):
             moved = Path(real)
+        else:
+            moved = move_real_file(real, dest)
 
         self.store.set_fingerprint_home(
             digest,
@@ -2282,7 +3671,7 @@ class App(ttk.Frame):
         try:
             def _progress(msg: str):
                 if self._lifecycle_alive:
-                    self.after(0, lambda m=msg: self.import_status.set(m))
+                    self._ui_schedule(lambda m=msg: self.import_status.set(m))
 
             ext_stats = extract_toplevel_archives(
                 root,
@@ -2305,7 +3694,7 @@ class App(ttk.Frame):
                 return
 
             if self._lifecycle_alive:
-                self.after(0, lambda: self.import_status.set('Listing gallery folders…'))
+                self._ui_schedule(lambda: self.import_status.set('Listing gallery folders…'))
 
             folders = scan_gallery_folders(root)
             for folder in folders:
@@ -2348,9 +3737,7 @@ class App(ttk.Frame):
         finally:
             self._import_busy = False
             if self._lifecycle_alive:
-                self.after(
-                    0,
-                    lambda r=rows, rt=root, es=ext_stats: self._import_scan_apply(
+                self._ui_schedule(lambda r=rows, rt=root, es=ext_stats: self._import_scan_apply(
                         r, rt, es
                     ),
                 )
@@ -2451,7 +3838,7 @@ class App(ttk.Frame):
                 done.set()
 
         try:
-            self.after(0, ask)
+            self._ui_schedule(ask)
         except tk.TclError:
             return None
         while not done.wait(0.25):
@@ -2509,8 +3896,7 @@ class App(ttk.Frame):
                     self.store.set_gallery_meta(url, out_dir=row.get('path'))
                 except Exception:
                     pass
-                self.after(
-                    0, lambda u=url, i=iid: self._import_ui_after_enqueue(u, i)
+                self._ui_schedule(lambda u=url, i=iid: self._import_ui_after_enqueue(u, i)
                 )
                 return False
             self.store.enqueue(
@@ -2524,7 +3910,7 @@ class App(ttk.Frame):
                 out_dir=row.get('path'),
             )
             row['in_queue'] = True
-            self.after(0, lambda u=url, i=iid: self._import_ui_after_enqueue(u, i))
+            self._ui_schedule(lambda u=url, i=iid: self._import_ui_after_enqueue(u, i))
             self.ui_log(f"Import queued: {key} ← {(row.get('name') or '')[:50]!r}")
             return True
         except Exception as e:
@@ -2565,7 +3951,7 @@ class App(ttk.Frame):
                         self.ui_log(f'Import verify error ({name[:40]}): {e}')
                         done += 1
                         try:
-                            self.after(0, lambda i=iid: self._import_refresh_row(i))
+                            self._ui_schedule(lambda i=iid: self._import_refresh_row(i))
                         except tk.TclError:
                             break
                         continue
@@ -2591,15 +3977,13 @@ class App(ttk.Frame):
                         )
                     done += 1
                     try:
-                        self.after(0, lambda i=iid: self._import_refresh_row(i))
+                        self._ui_schedule(lambda i=iid: self._import_refresh_row(i))
                     except tk.TclError:
                         break
                     continue
 
                 try:
-                    self.after(
-                        0,
-                        lambda d=done, t=total, n=name[:50]: self.import_status.set(
+                    self._ui_schedule(lambda d=done, t=total, n=name[:50]: self.import_status.set(
                             f'Searching EH… {d}/{t} — {n}'
                         ),
                     )
@@ -2647,9 +4031,7 @@ class App(ttk.Frame):
                         sha_hits: list[dict] = []
                         if folder.is_dir():
                             try:
-                                self.after(
-                                    0,
-                                    lambda n=name[:50]: self.import_status.set(
+                                self._ui_schedule(lambda n=name[:50]: self.import_status.set(
                                         f'SHA fallback… {n}'
                                     ),
                                 )
@@ -2735,16 +4117,14 @@ class App(ttk.Frame):
                     self.ui_log(f'Import search error ({name[:40]}): {e}')
                 done += 1
                 try:
-                    self.after(0, lambda i=iid: self._import_refresh_row(i))
+                    self._ui_schedule(lambda i=iid: self._import_refresh_row(i))
                 except tk.TclError:
                     break
         finally:
             self._import_busy = False
             if self._lifecycle_alive:
                 try:
-                    self.after(
-                        0,
-                        lambda d=done, t=total, q=queued: self.import_status.set(
+                    self._ui_schedule(lambda d=done, t=total, q=queued: self.import_status.set(
                             f'Search done — {d}/{t}, queued {q}'
                             + (' (stopped)' if self._import_stop.is_set() else '')
                         ),
@@ -2820,13 +4200,13 @@ class App(ttk.Frame):
                         skipped += 1
                         row['in_galleries'] = True
                         self.ui_log(f'Import skip (already in DB): {key}')
-                        self.after(0, lambda i=iid: self._import_refresh_row(i))
+                        self._ui_schedule(lambda i=iid: self._import_refresh_row(i))
                         continue
                     if self.store.is_queued_key(key):
                         skipped += 1
                         row['in_queue'] = True
                         self.ui_log(f'Import skip (in queue): {key}')
-                        self.after(0, lambda i=iid: self._import_refresh_row(i))
+                        self._ui_schedule(lambda i=iid: self._import_refresh_row(i))
                         continue
                     folder = Path(row['path'])
                     title = row.get('match_title') or row.get('name')
@@ -2855,16 +4235,14 @@ class App(ttk.Frame):
                     self.ui_log(f'Import failed {key}: {e}')
                     log.exception('import failed: %s', e)
                 try:
-                    self.after(0, lambda i=iid: self._import_refresh_row(i))
+                    self._ui_schedule(lambda i=iid: self._import_refresh_row(i))
                 except tk.TclError:
                     break
         finally:
             self._import_busy = False
             if self._lifecycle_alive:
                 try:
-                    self.after(
-                        0,
-                        lambda o=ok, s=skipped: self.import_status.set(
+                    self._ui_schedule(lambda o=ok, s=skipped: self.import_status.set(
                             f'Import done — {o} imported, {s} skipped'
                         ),
                     )
@@ -2953,28 +4331,36 @@ class App(ttk.Frame):
             pass
         if saved is not None:
             self.eh_scan_var.set(saved not in ('0', 'false', 'False', 'no'))
+        self._sync_eh_scan_enabled()
         self._hash_worker = EhHashCheckWorker(
             self.store,
             on_matches=self._on_eh_matches,
             on_status=self._on_eh_scan_status,
             lifecycle_alive=lambda: self._lifecycle_alive,
             # Pause f_shash while downloading — same IP budget as gallery traffic.
-            enabled=lambda: bool(self.eh_scan_var.get()) and not (
+            enabled=lambda: self._eh_scan_enabled and not (
                 self._worker and self._worker.is_alive()
             ),
         )
         self._hash_worker.start()
 
+    def _sync_eh_scan_enabled(self):
+        try:
+            self._eh_scan_enabled = bool(self.eh_scan_var.get())
+        except tk.TclError:
+            pass
+
     def _on_eh_scan_toggle(self):
+        self._sync_eh_scan_enabled()
         if self.store:
             try:
                 self.store.set_setting(
                     'eh_dupe_scan',
-                    '1' if self.eh_scan_var.get() else '0',
+                    '1' if self._eh_scan_enabled else '0',
                 )
             except Exception:
                 pass
-        if self.eh_scan_var.get():
+        if self._eh_scan_enabled:
             self.ui_log('EH dupe scan enabled')
         else:
             self.ui_log('EH dupe scan paused')
@@ -2986,10 +4372,7 @@ class App(ttk.Frame):
         # Don't clobber an active download status line.
         if self._worker and self._worker.is_alive():
             return
-        try:
-            self.after(0, lambda t=text: self._refresh_idle_status(t))
-        except tk.TclError:
-            pass
+        self._ui_schedule(lambda t=text: self._refresh_idle_status(t))
 
     def _refresh_idle_status(self, scan_text: str | None = None):
         if not self._lifecycle_alive:
@@ -3019,10 +4402,7 @@ class App(ttk.Frame):
         """Called from hash-check thread — marshal to UI thread."""
         if not self._lifecycle_alive or not matches:
             return
-        try:
-            self.after(0, lambda m=list(matches): self._auto_enqueue_matches(m))
-        except tk.TclError:
-            pass
+        self._ui_schedule(lambda m=list(matches): self._auto_enqueue_matches(m))
 
     def _auto_enqueue_matches(self, matches: list[dict]):
         if not self._lifecycle_alive or not self.store:
@@ -3575,18 +4955,12 @@ class App(ttk.Frame):
             except tk.TclError:
                 pass
 
-        try:
-            self.after(0, _append)
-        except tk.TclError:
-            pass
+        self._ui_schedule(_append)
 
     def set_status(self, text):
         if not self._lifecycle_alive:
             return
-        try:
-            self.after(0, lambda: self.status.set(text))
-        except tk.TclError:
-            pass
+        self._ui_schedule(lambda: self.status.set(text))
 
     def start(self):
         if self._worker and self._worker.is_alive():
@@ -3653,7 +5027,7 @@ class App(ttk.Frame):
                 except queue.Empty:
                     break
                 self._current_url = url
-                self.after(0, self._mark_queue_current, url)
+                self._ui_schedule(self._mark_queue_current, url)
                 self.set_status(
                     f'Working… ({self.job_queue.qsize()} left, {workers} workers)'
                 )
@@ -3678,13 +5052,13 @@ class App(ttk.Frame):
                     workers=workers,
                     store=self.store,
                     gallery_url=url,
-                    on_meta=lambda title=None, image_total=None, u=url: self.after(
-                        0,
-                        lambda: self._update_running_queue_meta(
+                    on_meta=lambda title=None, image_total=None, u=url: self._ui_schedule(lambda: self._update_running_queue_meta(
                             u, title=title, image_total=image_total
                         ),
                     ),
                 )
+                # Optional wake hook for near-pair incremental updates.
+                dl._dhash_worker = self._dhash_worker
                 try:
                     stats = dl.parse_gallery(url)
                     if self.store:
@@ -3715,9 +5089,7 @@ class App(ttk.Frame):
                             log.exception('complete_gallery failed: %s', e)
                     done += 1
                     if self._lifecycle_alive:
-                        self.after(
-                            0,
-                            lambda u=url, s=stats: self._finish_queue_item(u, stats=s),
+                        self._ui_schedule(lambda u=url, s=stats: self._finish_queue_item(u, stats=s),
                         )
                 except Exception as e:
                     # Hot-reload replaces DownloadStopped class identity; also treat
@@ -3742,7 +5114,7 @@ class App(ttk.Frame):
                             except Exception as db_e:
                                 self.ui_log(f'DB mark_stopped failed: {db_e}')
                         if self._lifecycle_alive:
-                            self.after(0, self._release_queue_current, url)
+                            self._ui_schedule(self._release_queue_current, url)
                         break
                     msg = str(e) or type(e).__name__
                     self.ui_log(f'Gallery error: {msg}')
@@ -3753,10 +5125,10 @@ class App(ttk.Frame):
                         except Exception as db_e:
                             self.ui_log(f'DB mark_failed failed: {db_e}')
                     if self._lifecycle_alive:
-                        self.after(0, self._release_queue_current, url)
+                        self._ui_schedule(self._release_queue_current, url)
         finally:
             if self._lifecycle_alive:
-                self.after(0, self._worker_done, done)
+                self._ui_schedule(self._worker_done, done)
 
     def _mark_queue_current(self, url: str):
         """Keep the active gallery visible (▶ green) so URL can be copied."""

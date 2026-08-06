@@ -14,6 +14,8 @@ from pathlib import Path
 
 import pyodbc
 
+from image_dhash import from_sql_bigint, order_sha_pair, to_sql_bigint
+
 _REPO = Path(__file__).resolve().parent
 _GALLERY_RE = re.compile(r"/g/(\d+)/([0-9a-fA-F]+)")
 # EH image page: /s/{img_key}/{gallery_id}-{page}
@@ -392,6 +394,49 @@ class QueueStore:
                 ALTER TABLE dbo.image_fingerprints ADD
                     home_decided BIT NOT NULL
                         CONSTRAINT DF_fp_home_decided DEFAULT (0);
+
+                -- Unreadable sample (missing/corrupt): stop fill spin-loop.
+                IF COL_LENGTH(N'dbo.image_fingerprints', N'dhash_failed') IS NULL
+                ALTER TABLE dbo.image_fingerprints ADD
+                    dhash_failed BIT NOT NULL
+                        CONSTRAINT DF_fp_dhash_failed DEFAULT (0);
+
+                -- dHash near-dupe pairs (cross-gallery, sha1_a < sha1_b).
+                IF OBJECT_ID(N'dbo.dhash_near_pairs', N'U') IS NULL
+                CREATE TABLE dbo.dhash_near_pairs (
+                    sha1_a       BINARY(20)  NOT NULL,
+                    sha1_b       BINARY(20)  NOT NULL,
+                    hamming      TINYINT     NOT NULL,
+                    updated_at   DATETIME2   NOT NULL
+                        CONSTRAINT DF_dhash_near_upd DEFAULT (SYSUTCDATETIME()),
+                    CONSTRAINT PK_dhash_near_pairs PRIMARY KEY (sha1_a, sha1_b),
+                    CONSTRAINT CK_dhash_near_order CHECK (sha1_a < sha1_b)
+                );
+
+                IF NOT EXISTS (
+                    SELECT 1 FROM sys.indexes
+                    WHERE name = N'IX_dhash_near_b'
+                      AND object_id = OBJECT_ID(N'dbo.dhash_near_pairs')
+                )
+                CREATE INDEX IX_dhash_near_b
+                    ON dbo.dhash_near_pairs (sha1_b);
+
+                -- User-dismissed near matches (never re-surface).
+                IF OBJECT_ID(N'dbo.dhash_false_positives', N'U') IS NULL
+                CREATE TABLE dbo.dhash_false_positives (
+                    sha1_a       BINARY(20)  NOT NULL,
+                    sha1_b       BINARY(20)  NOT NULL,
+                    created_at   DATETIME2   NOT NULL
+                        CONSTRAINT DF_dhash_fp_created DEFAULT (SYSUTCDATETIME()),
+                    CONSTRAINT PK_dhash_false_positives PRIMARY KEY (sha1_a, sha1_b),
+                    CONSTRAINT CK_dhash_fp_order CHECK (sha1_a < sha1_b)
+                );
+
+                -- dhash | manual (neighbor Link). Rebuild must not wipe manuals.
+                IF COL_LENGTH(N'dbo.dhash_near_pairs', N'source') IS NULL
+                ALTER TABLE dbo.dhash_near_pairs ADD
+                    source NVARCHAR(16) NOT NULL
+                        CONSTRAINT DF_dhash_near_src DEFAULT (N'dhash');
                 """
             )
             self._conn().commit()
@@ -416,7 +461,7 @@ class QueueStore:
             "byte_len": int(row[1]) if row[1] is not None else None,
             "gallery_key": row[2],
             "seen_count": int(row[3] or 0),
-            "dhash": int(row[4]) if row[4] is not None else None,
+            "dhash": from_sql_bigint(int(row[4])) if row[4] is not None else None,
         }
 
     def list_name_aliases(self, digest: bytes) -> list[dict]:
@@ -551,6 +596,7 @@ class QueueStore:
             raise ValueError("sha1 digest must be 20 bytes")
         path = (sample_path or "")[:400] or None
         gkey = (gallery_key or "")[:64] or None
+        sql_dhash = to_sql_bigint(dhash) if dhash is not None else None
         with self._lock:
             cur = self._conn().cursor()
             row = cur.execute(
@@ -566,7 +612,7 @@ class QueueStore:
                         updated_at = SYSUTCDATETIME()
                     WHERE sha1 = ?
                     """,
-                    dhash,
+                    sql_dhash,
                     digest,
                 )
             else:
@@ -578,7 +624,7 @@ class QueueStore:
                     """,
                     digest,
                     int(byte_len),
-                    dhash,
+                    sql_dhash,
                     path,
                     gkey,
                 )
@@ -630,6 +676,7 @@ class QueueStore:
                 SET sample_path = ?,
                     gallery_key = COALESCE(?, gallery_key),
                     home_decided = ?,
+                    dhash_failed = 0,
                     updated_at = SYSUTCDATETIME()
                 WHERE sha1 = ?
                 """,
@@ -785,6 +832,537 @@ class QueueStore:
             )
         return out
 
+    # --- dHash near-dupes -------------------------------------------------
+
+    def dhash_fill_stats(self) -> dict:
+        """Counts for fill progress (total / filled / missing / failed)."""
+        with self._lock:
+            row = self._conn().cursor().execute(
+                """
+                SELECT
+                    COUNT(*),
+                    SUM(CASE WHEN dhash IS NOT NULL THEN 1 ELSE 0 END),
+                    SUM(CASE
+                        WHEN dhash IS NULL AND ISNULL(dhash_failed, 0) = 0
+                        THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN ISNULL(dhash_failed, 0) = 1 THEN 1 ELSE 0 END)
+                FROM dbo.image_fingerprints
+                """
+            ).fetchone()
+        return {
+            "total": int(row[0] or 0),
+            "filled": int(row[1] or 0),
+            "missing": int(row[2] or 0),
+            "failed": int(row[3] or 0),
+        }
+
+    def list_fingerprints_missing_dhash(self, *, limit: int = 100) -> list[dict]:
+        """Batch of fingerprints that still need a dHash (have sample_path)."""
+        with self._lock:
+            rows = self._conn().cursor().execute(
+                """
+                SELECT TOP (?) sha1, sample_path
+                FROM dbo.image_fingerprints
+                WHERE dhash IS NULL
+                  AND ISNULL(dhash_failed, 0) = 0
+                  AND sample_path IS NOT NULL
+                  AND sample_path <> N''
+                ORDER BY updated_at ASC
+                """,
+                int(limit),
+            ).fetchall()
+        return [
+            {"sha1": bytes(r[0]), "sample_path": r[1]} for r in rows
+        ]
+
+    def list_paths_for_sha(self, digest: bytes) -> list[str]:
+        """Canonical + alias sample paths for a SHA (deduped, non-empty)."""
+        if not digest or len(digest) != 20:
+            return []
+        with self._lock:
+            cur = self._conn().cursor()
+            row = cur.execute(
+                """
+                SELECT sample_path FROM dbo.image_fingerprints WHERE sha1 = ?
+                """,
+                digest,
+            ).fetchone()
+            alias_rows = cur.execute(
+                """
+                SELECT DISTINCT sample_path
+                FROM dbo.image_name_aliases
+                WHERE sha1 = ?
+                  AND sample_path IS NOT NULL
+                  AND sample_path <> N''
+                """,
+                digest,
+            ).fetchall()
+        seen: set[str] = set()
+        out: list[str] = []
+        for raw in ([row[0] if row else None] + [r[0] for r in alias_rows]):
+            p = (raw or "").strip()
+            if not p or p in seen:
+                continue
+            seen.add(p)
+            out.append(p)
+        return out
+
+    def touch_fingerprint(self, digest: bytes) -> None:
+        """Bump ``updated_at`` so failed dHash fills rotate to the back."""
+        if not digest or len(digest) != 20:
+            return
+        with self._lock:
+            self._conn().cursor().execute(
+                """
+                UPDATE dbo.image_fingerprints
+                SET updated_at = SYSUTCDATETIME()
+                WHERE sha1 = ?
+                """,
+                digest,
+            )
+            self._conn().commit()
+
+    def mark_dhash_failed(self, digest: bytes) -> None:
+        """Stop retrying unreadable samples (missing/corrupt file)."""
+        if not digest or len(digest) != 20:
+            return
+        with self._lock:
+            self._conn().cursor().execute(
+                """
+                UPDATE dbo.image_fingerprints
+                SET dhash_failed = 1, updated_at = SYSUTCDATETIME()
+                WHERE sha1 = ? AND dhash IS NULL
+                """,
+                digest,
+            )
+            self._conn().commit()
+
+    def set_fingerprint_dhash(self, digest: bytes, dhash: int) -> None:
+        """Store unsigned 64-bit dHash for ``digest``."""
+        if not digest or len(digest) != 20:
+            raise ValueError("sha1 digest must be 20 bytes")
+        with self._lock:
+            self._conn().cursor().execute(
+                """
+                UPDATE dbo.image_fingerprints
+                SET dhash = ?,
+                    dhash_failed = 0,
+                    updated_at = SYSUTCDATETIME()
+                WHERE sha1 = ?
+                """,
+                to_sql_bigint(dhash),
+                digest,
+            )
+            self._conn().commit()
+
+    def load_dhash_rows(self) -> list[tuple[bytes, int]]:
+        """All ``(sha1, dhash)`` with a filled dHash."""
+        with self._lock:
+            rows = self._conn().cursor().execute(
+                """
+                SELECT sha1, dhash
+                FROM dbo.image_fingerprints
+                WHERE dhash IS NOT NULL
+                """
+            ).fetchall()
+        out: list[tuple[bytes, int]] = []
+        for r in rows:
+            dh = from_sql_bigint(int(r[1]))
+            if dh is not None:
+                out.append((bytes(r[0]), dh))
+        return out
+
+    def load_sha_gallery_keys(self) -> dict[bytes, set[str]]:
+        """sha1 → set of non-empty gallery keys from aliases."""
+        with self._lock:
+            rows = self._conn().cursor().execute(
+                """
+                SELECT DISTINCT sha1, gallery_key
+                FROM dbo.image_name_aliases
+                WHERE gallery_key <> N''
+                """
+            ).fetchall()
+        out: dict[bytes, set[str]] = {}
+        for r in rows:
+            digest = bytes(r[0])
+            out.setdefault(digest, set()).add(r[1])
+        return out
+
+    def load_false_positive_pairs(self) -> set[tuple[bytes, bytes]]:
+        with self._lock:
+            rows = self._conn().cursor().execute(
+                "SELECT sha1_a, sha1_b FROM dbo.dhash_false_positives"
+            ).fetchall()
+        return {(bytes(r[0]), bytes(r[1])) for r in rows}
+
+    def rebuild_dhash_near_pairs(self, *, max_hamming: int = 5) -> dict:
+        """Full in-memory BK-tree rebuild of ``dhash_near_pairs``.
+
+        Skips false positives and same-gallery-only pairs. Returns stats.
+        """
+        from image_dhash import find_near_pairs
+
+        rows = self.load_dhash_rows()
+        gallery_keys = self.load_sha_gallery_keys()
+        fps = self.load_false_positive_pairs()
+        pairs = []
+        for a, b, dist in find_near_pairs(
+            rows, max_hamming=int(max_hamming), gallery_keys=gallery_keys
+        ):
+            if (a, b) in fps:
+                continue
+            pairs.append((a, b, int(dist)))
+
+        with self._lock:
+            cur = self._conn().cursor()
+            # Keep user manual Links; only refresh automatic dHash pairs.
+            cur.execute(
+                """
+                DELETE FROM dbo.dhash_near_pairs
+                WHERE ISNULL(source, N'dhash') <> N'manual'
+                """
+            )
+            if pairs:
+                cur.fast_executemany = True
+                cur.executemany(
+                    """
+                    INSERT INTO dbo.dhash_near_pairs (sha1_a, sha1_b, hamming, source)
+                    VALUES (?, ?, ?, N'dhash')
+                    """,
+                    pairs,
+                )
+            self._conn().commit()
+        return {
+            "fingerprints": len(rows),
+            "pairs": len(pairs),
+            "max_hamming": int(max_hamming),
+        }
+
+    def upsert_dhash_near_for_sha(
+        self,
+        digest: bytes,
+        dhash: int,
+        *,
+        max_hamming: int = 5,
+        tree_hits: list[tuple[bytes, int]] | None = None,
+        gallery_keys: dict[bytes, set[str]] | None = None,
+        false_positives: set[tuple[bytes, bytes]] | None = None,
+    ) -> int:
+        """Insert near pairs involving ``digest`` (from BK-tree probe hits).
+
+        ``tree_hits`` is ``[(other_sha, hamming), ...]``. Returns insert count.
+        Pass ``gallery_keys`` / ``false_positives`` from the worker to avoid
+        reloading the full maps on every fingerprint.
+        """
+        if not digest or len(digest) != 20:
+            return 0
+        if gallery_keys is None:
+            gallery_keys = self.load_sha_gallery_keys()
+        if false_positives is None:
+            false_positives = self.load_false_positive_pairs()
+        ga = gallery_keys.get(digest) or set()
+        fps = false_positives
+        rows = []
+        for other, dist in tree_hits or []:
+            if not other or other == digest or dist > max_hamming:
+                continue
+            a, b = order_sha_pair(digest, other)
+            if (a, b) in fps:
+                continue
+            gb = gallery_keys.get(other) or set()
+            if not ga or not gb or (ga == gb and len(ga) == 1):
+                continue
+            rows.append((a, b, int(dist)))
+        if not rows:
+            return 0
+        with self._lock:
+            cur = self._conn().cursor()
+            for a, b, dist in rows:
+                cur.execute(
+                    """
+                    MERGE dbo.dhash_near_pairs AS t
+                    USING (SELECT ? AS sha1_a, ? AS sha1_b, ? AS hamming) AS s
+                    ON t.sha1_a = s.sha1_a AND t.sha1_b = s.sha1_b
+                    WHEN MATCHED AND ISNULL(t.source, N'dhash') = N'dhash' THEN
+                        UPDATE SET hamming = s.hamming,
+                                   updated_at = SYSUTCDATETIME()
+                    WHEN NOT MATCHED THEN
+                        INSERT (sha1_a, sha1_b, hamming, source)
+                        VALUES (s.sha1_a, s.sha1_b, s.hamming, N'dhash');
+                    """,
+                    a,
+                    b,
+                    dist,
+                )
+            self._conn().commit()
+        return len(rows)
+
+    def add_manual_near_pair(self, sha_a: bytes, sha_b: bytes) -> bool:
+        """Link two different SHAs by hand (neighbor match). Hamming=255 sentinel."""
+        if not sha_a or not sha_b or sha_a == sha_b:
+            return False
+        a, b = order_sha_pair(sha_a, sha_b)
+        with self._lock:
+            cur = self._conn().cursor()
+            cur.execute(
+                """
+                MERGE dbo.dhash_near_pairs AS t
+                USING (SELECT ? AS sha1_a, ? AS sha1_b) AS s
+                ON t.sha1_a = s.sha1_a AND t.sha1_b = s.sha1_b
+                WHEN MATCHED THEN
+                    UPDATE SET source = N'manual',
+                               hamming = 255,
+                               updated_at = SYSUTCDATETIME()
+                WHEN NOT MATCHED THEN
+                    INSERT (sha1_a, sha1_b, hamming, source)
+                    VALUES (s.sha1_a, s.sha1_b, 255, N'manual');
+                """,
+                a,
+                b,
+            )
+            # Drop FP if user is explicitly linking.
+            cur.execute(
+                """
+                DELETE FROM dbo.dhash_false_positives
+                WHERE sha1_a = ? AND sha1_b = ?
+                """,
+                a,
+                b,
+            )
+            self._conn().commit()
+        return True
+
+    def load_linked_sha_pairs(self) -> set[tuple[bytes, bytes]]:
+        """All near/manual linked ordered pairs (for board neighbor hints)."""
+        with self._lock:
+            rows = self._conn().cursor().execute(
+                "SELECT sha1_a, sha1_b FROM dbo.dhash_near_pairs"
+            ).fetchall()
+        return {(bytes(r[0]), bytes(r[1])) for r in rows}
+
+    def shas_are_linked(self, sha_a: bytes, sha_b: bytes) -> bool:
+        if not sha_a or not sha_b:
+            return False
+        if sha_a == sha_b:
+            return True
+        a, b = order_sha_pair(sha_a, sha_b)
+        with self._lock:
+            row = self._conn().cursor().execute(
+                """
+                SELECT 1 FROM dbo.dhash_near_pairs
+                WHERE sha1_a = ? AND sha1_b = ?
+                """,
+                a,
+                b,
+            ).fetchone()
+        return bool(row)
+
+    def mark_dhash_false_positive(self, sha_a: bytes, sha_b: bytes) -> None:
+        """Dismiss a near pair permanently and drop it from the cache."""
+        a, b = order_sha_pair(sha_a, sha_b)
+        with self._lock:
+            cur = self._conn().cursor()
+            cur.execute(
+                """
+                IF NOT EXISTS (
+                    SELECT 1 FROM dbo.dhash_false_positives
+                    WHERE sha1_a = ? AND sha1_b = ?
+                )
+                INSERT INTO dbo.dhash_false_positives (sha1_a, sha1_b)
+                VALUES (?, ?)
+                """,
+                a,
+                b,
+                a,
+                b,
+            )
+            cur.execute(
+                """
+                DELETE FROM dbo.dhash_near_pairs
+                WHERE sha1_a = ? AND sha1_b = ?
+                """,
+                a,
+                b,
+            )
+            self._conn().commit()
+
+    def list_near_dupe_galleries(self, *, limit: int = 500) -> list[dict]:
+        """Galleries that participate in ≥1 cached dHash near pair."""
+        with self._lock:
+            rows = self._conn().cursor().execute(
+                """
+                SELECT TOP (?)
+                    a.gallery_key,
+                    COUNT(DISTINCT CASE
+                        WHEN p.sha1_a = a.sha1 THEN p.sha1_b ELSE p.sha1_a
+                    END) AS shared_count,
+                    COUNT(DISTINCT peer.gallery_key) AS peer_count,
+                    MAX(COALESCE(g.title, q.title)) AS title,
+                    MAX(COALESCE(g.out_dir, q.out_dir)) AS out_dir,
+                    MAX(COALESCE(g.url, q.url)) AS url,
+                    COUNT(DISTINCT CASE
+                        WHEN p.sha1_a = a.sha1 THEN p.sha1_b ELSE p.sha1_a
+                    END) AS undecided_count
+                FROM dbo.dhash_near_pairs p
+                INNER JOIN dbo.image_name_aliases a
+                    ON a.sha1 IN (p.sha1_a, p.sha1_b)
+                   AND a.gallery_key <> N''
+                INNER JOIN dbo.image_name_aliases peer
+                    ON peer.sha1 IN (p.sha1_a, p.sha1_b)
+                   AND peer.gallery_key <> a.gallery_key
+                   AND peer.gallery_key <> N''
+                   AND (
+                        (a.sha1 = p.sha1_a AND peer.sha1 = p.sha1_b)
+                     OR (a.sha1 = p.sha1_b AND peer.sha1 = p.sha1_a)
+                   )
+                LEFT JOIN dbo.galleries g ON g.gallery_key = a.gallery_key
+                LEFT JOIN dbo.queue_items q ON q.gallery_key = a.gallery_key
+                GROUP BY a.gallery_key
+                ORDER BY shared_count DESC, a.gallery_key ASC
+                """,
+                int(limit),
+            ).fetchall()
+        return [
+            {
+                "gallery_key": r[0],
+                "shared_count": int(r[1] or 0),
+                "peer_count": int(r[2] or 0),
+                "title": r[3],
+                "out_dir": r[4],
+                "url": r[5],
+                "undecided_count": int(r[6] or 0),
+            }
+            for r in rows
+        ]
+
+    def list_near_files_for_gallery(self, gallery_key: str) -> list[dict]:
+        """Near-dupe rows for ``gallery_key`` (one row per local sha + best peer)."""
+        key = (gallery_key or "").strip()[:64]
+        if not key:
+            return []
+        with self._lock:
+            cur = self._conn().cursor()
+            pair_rows = cur.execute(
+                """
+                SELECT
+                    CASE WHEN la.sha1 = p.sha1_a THEN p.sha1_a ELSE p.sha1_b END
+                        AS local_sha,
+                    CASE WHEN la.sha1 = p.sha1_a THEN p.sha1_b ELSE p.sha1_a END
+                        AS peer_sha,
+                    p.hamming,
+                    fl.sample_path AS local_sample,
+                    fp.sample_path AS peer_sample,
+                    fl.byte_len AS local_bytes,
+                    fp.byte_len AS peer_bytes,
+                    fl.dhash AS local_dhash,
+                    fp.dhash AS peer_dhash,
+                    ISNULL(p.source, N'dhash') AS pair_source
+                FROM dbo.dhash_near_pairs p
+                INNER JOIN dbo.image_name_aliases la
+                    ON la.sha1 IN (p.sha1_a, p.sha1_b)
+                   AND la.gallery_key = ?
+                INNER JOIN dbo.image_fingerprints fl
+                    ON fl.sha1 = CASE
+                        WHEN la.sha1 = p.sha1_a THEN p.sha1_a ELSE p.sha1_b END
+                INNER JOIN dbo.image_fingerprints fp
+                    ON fp.sha1 = CASE
+                        WHEN la.sha1 = p.sha1_a THEN p.sha1_b ELSE p.sha1_a END
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM dbo.dhash_false_positives f
+                    WHERE f.sha1_a = p.sha1_a AND f.sha1_b = p.sha1_b
+                )
+                ORDER BY
+                    CASE WHEN ISNULL(p.source, N'dhash') = N'manual' THEN 1 ELSE 0 END,
+                    p.hamming ASC,
+                    local_sha
+                """,
+                key,
+            ).fetchall()
+            if not pair_rows:
+                return []
+
+            # Deduplicate: keep lowest-hamming peer per local sha.
+            best: dict[bytes, tuple] = {}
+            for r in pair_rows:
+                local = bytes(r[0])
+                prev = best.get(local)
+                if prev is None or int(r[2]) < int(prev[2]):
+                    best[local] = r
+
+            digests: list[bytes] = []
+            for r in best.values():
+                digests.append(bytes(r[0]))
+                digests.append(bytes(r[1]))
+            digests = list(dict.fromkeys(digests))
+            placeholders = ",".join("?" * len(digests))
+            alias_rows = cur.execute(
+                f"""
+                SELECT sha1, name, bare_name, gallery_key, sample_path
+                FROM dbo.image_name_aliases
+                WHERE sha1 IN ({placeholders})
+                ORDER BY created_at ASC, id ASC
+                """,
+                *digests,
+            ).fetchall()
+
+        by_sha: dict[bytes, list[dict]] = {d: [] for d in digests}
+        for r in alias_rows:
+            digest = bytes(r[0])
+            by_sha.setdefault(digest, []).append(
+                {
+                    "name": r[1],
+                    "bare_name": r[2],
+                    "gallery_key": r[3] or "",
+                    "sample_path": r[4],
+                }
+            )
+
+        out = []
+        for r in best.values():
+            local = bytes(r[0])
+            peer = bytes(r[1])
+            peer_aliases = by_sha.get(peer, [])
+            peer_key = ""
+            for a in peer_aliases:
+                gk = a.get("gallery_key") or ""
+                if gk and gk != key:
+                    peer_key = gk
+                    break
+            out.append(
+                {
+                    "sha1": local,
+                    "sha1_hex": local.hex(),
+                    "peer_sha1": peer,
+                    "peer_sha1_hex": peer.hex(),
+                    "hamming": int(r[2]),
+                    "sample_path": r[3],
+                    "peer_sample_path": r[4],
+                    "byte_len": int(r[5]) if r[5] is not None else None,
+                    "peer_byte_len": int(r[6]) if r[6] is not None else None,
+                    "dhash": from_sql_bigint(int(r[7])) if r[7] is not None else None,
+                    "peer_dhash": (
+                        from_sql_bigint(int(r[8])) if r[8] is not None else None
+                    ),
+                    "pair_source": (r[9] or "dhash").strip().lower(),
+                    "home_gallery_key": peer_key,
+                    "home_decided": False,
+                    "match_kind": (
+                        "manual"
+                        if (r[9] or "").strip().lower() == "manual"
+                        else "near"
+                    ),
+                    "aliases": by_sha.get(local, []) + peer_aliases,
+                }
+            )
+        out.sort(
+            key=lambda x: (
+                0 if x["match_kind"] == "near" else 1,
+                x["hamming"],
+                x["sha1_hex"],
+            )
+        )
+        return out
+
     def list_gallery_ordered_names(self, gallery_key: str) -> list[dict]:
         """Alias filenames for a gallery, sorted for neighbor context."""
         key = (gallery_key or "").strip()[:64]
@@ -793,7 +1371,7 @@ class QueueStore:
         with self._lock:
             rows = self._conn().cursor().execute(
                 """
-                SELECT name, bare_name, sample_path
+                SELECT name, bare_name, sample_path, sha1
                 FROM dbo.image_name_aliases
                 WHERE gallery_key = ?
                 ORDER BY name ASC, id ASC
@@ -805,6 +1383,7 @@ class QueueStore:
                 "name": r[0] or "",
                 "bare_name": r[1] or "",
                 "sample_path": r[2],
+                "sha1": bytes(r[3]) if r[3] is not None else None,
             }
             for r in rows
             if r[0]

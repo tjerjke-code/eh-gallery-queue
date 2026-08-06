@@ -24,9 +24,13 @@
   `tools/backfill_pics.py`
 
 ### Perceptual dHash for post-resize matching
-- Status: **deferred**
-- Column `image_fingerprints.dhash` exists (nullable BIGINT). Fill when the
-  resize pipeline lands; match equal / small Hamming distance.
+- Status: **partial** (Duped Near mode)
+- Column `image_fingerprints.dhash` filled by background worker + on register
+- Cached `dhash_near_pairs` (BK-tree rebuild / incremental upsert)
+- `dhash_false_positives` for dismissed pairs
+- Duped: Exact SHA / Near dHash toggle; scrollable ±3 match board + hover;
+  mark FP; manual neighbor Link (source=manual)
+- No move/home for near matches yet (review-only)
 
 ### Queue filter (manual / auto / all)
 - Status: **partial**
@@ -43,6 +47,8 @@
   `home_decided` so those SHAs reappear for review; Strip peers removes peer
   symlinks that point at the home file (nofollow path guard)
 - Auto-symlink into gallery folder when download skips on exact SHA match
+- Duped: Exact/Near toggle; scrollable match board (±3 strips, Link neighbors);
+  false positives; manual pairs survive Rebuild
 - Local Import tab: scan pics folders, EH title search (quoted `f_search` +
   fallbacks), register into `galleries` + fingerprints, or enqueue to verify
 - EH title search helper (`eh_title_search`) — full folder names fail unquoted;

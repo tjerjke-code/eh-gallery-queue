@@ -17,12 +17,14 @@ from tkinter import messagebox, ttk
 # Modules reloaded on Ctrl+R (deps first, UI last).
 RELOAD_DEPS = (
     'logger',
+    'image_dhash',
     'db',
     'activity_feed',
     'eh_hash_check',
     'eh_title_search',
     'local_import',
     'fs_links',
+    'dhash_fill',
     'app',
 )
 
