@@ -11,11 +11,13 @@ changes apply without restarting the process.
 ## How it works
 
 - Entry: `eh_gallery_queue.py` → `HotReloadShell` (durable `tk.Tk`)
-- Reloadable UI/downloader: `app.py` (`App` is a `ttk.Frame`)
+- Reloadable UI: `app.py` (Queue shell), `import_tab.py`, `duped_tab.py`;
+  download engine: `downloader.py`
 - Shortcut: Ctrl+R → `HotReloadShell.reload_app`
-- Dep order in `RELOAD_DEPS`: `logger`, `db`, `activity_feed`, `app`
-- Teardown: `App.prepare_for_reload()` stops the download worker and marks
-  the current gallery stopped in DB before the frame is destroyed
+- Dep order in `RELOAD_DEPS`: deps first (… `downloader`, `duped_tab`,
+  `import_tab`), then `app` last
+- Teardown: `App.prepare_for_reload()` → Import/Duped `shutdown()` + stop
+  download worker; marks the current gallery stopped in DB before destroy
 - Restore: async `QueueStore` reconnect + new `App` rehydrate from EH DB
 - Activity feed is owned by the shell and rebuilt on reload
 

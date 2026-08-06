@@ -29,7 +29,8 @@
 - Cached `dhash_near_pairs` (BK-tree rebuild / incremental upsert)
 - `dhash_false_positives` for dismissed pairs
 - Duped: Exact SHA / Near dHash toggle; scrollable ±3 match board + hover;
-  mark FP; manual neighbor Link (source=manual)
+  mark FP; manual neighbor Link (source=manual); large compare Toplevel;
+  UI module: `duped_tab.py`
 - No move/home for near matches yet (review-only)
 
 ### Queue filter (manual / auto / all)
@@ -48,9 +49,12 @@
   symlinks that point at the home file (nofollow path guard)
 - Auto-symlink into gallery folder when download skips on exact SHA match
 - Duped: Exact/Near toggle; scrollable match board (±3 strips, Link neighbors);
-  false positives; manual pairs survive Rebuild
+  false positives; manual pairs survive Rebuild; large compare window (double-click);
+  UI lives in `duped_tab.py` (`DupedTab`)
 - Local Import tab: scan pics folders, EH title search (quoted `f_search` +
-  fallbacks), register into `galleries` + fingerprints, or enqueue to verify
+  fallbacks), register into `galleries` + fingerprints, or enqueue to verify;
+  UI in `import_tab.py`
+- EH download engine in `downloader.py` (`EHDownloader`)
 - EH title search helper (`eh_title_search`) — full folder names fail unquoted;
   phrase quotes hit
 - EH `f_shash` slow check queue (`eh_sha_checks` / `eh_sha_match_galleries`)

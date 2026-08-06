@@ -25,6 +25,9 @@ RELOAD_DEPS = (
     'local_import',
     'fs_links',
     'dhash_fill',
+    'downloader',
+    'duped_tab',
+    'import_tab',
     'app',
 )
 
