@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from pathlib import Path
 
 import tkinter as tk
 from tkinter import messagebox, ttk
 
 from db import gallery_key_from_url
+from eh_hash_check import SEARCH_INTERVAL
 from eh_title_search import (
     default_session,
     search_by_folder_name,
