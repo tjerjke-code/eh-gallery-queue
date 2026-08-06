@@ -29,7 +29,12 @@ from db import (
     strip_order_prefix,
 )
 from eh_hash_check import EhHashCheckWorker, SEARCH_INTERVAL
-from eh_title_search import default_session, search_by_folder_name
+from eh_title_search import (
+    default_session,
+    search_by_folder_name,
+    search_by_sample_shash,
+    verify_hit_against_folder,
+)
 from fs_links import (
     ensure_symlink,
     move_real_file,
@@ -38,7 +43,13 @@ from fs_links import (
     same_path,
     strip_peer_presence,
 )
-from local_import import import_local_gallery, list_images, nat_key, scan_gallery_folders
+from local_import import (
+    extract_toplevel_archives,
+    import_local_gallery,
+    list_images,
+    nat_key,
+    scan_gallery_folders,
+)
 from logger import get_logger, log_feed
 
 log = get_logger('app')
@@ -497,7 +508,30 @@ class EHDownloader:
         url, soup = self.skip_warning(self.gallery_url)
         title_raw = soup.find('h1', id='gn').text
         title = sanitize_name(title_raw)
-        target_dir = Path(self.out_dir) / title
+        save_root = Path(self.out_dir)
+        target_dir = save_root / title
+        # Import enqueue stores the existing gallery folder on the queue row.
+        # mark_running() may temporarily set out_dir to Save-to root — ignore that.
+        if self.store:
+            try:
+                key = gallery_key_from_url(self.gallery_url)
+                prior = None
+                if key:
+                    q = self.store.find_queue_by_key(key)
+                    prior = (q or {}).get('out_dir')
+                if prior:
+                    p = Path(prior)
+                    try:
+                        is_save_root = p.resolve() == save_root.resolve()
+                    except OSError:
+                        is_save_root = (
+                            str(p).rstrip('\\/').casefold()
+                            == str(save_root).rstrip('\\/').casefold()
+                        )
+                    if p.is_dir() and not is_save_root:
+                        target_dir = p
+            except Exception:
+                pass
         target_dir.mkdir(parents=True, exist_ok=True)
 
         pages = self.page_count(soup)
@@ -740,7 +774,7 @@ class App(ttk.Frame):
         help_row.pack(fill='x')
         ttk.Label(
             help_row,
-            text='Scan Save-to folders → search EH by title → import into DB / queue',
+            text='Scan Save-to → search EH by title → auto-queue matches (or Import into DB)',
         ).pack(side='left')
 
         tools = ttk.Frame(parent, padding=(8, 0))
@@ -802,7 +836,9 @@ class App(ttk.Frame):
             side='left'
         )
 
-        self.import_status = tk.StringVar(value='Scan Save-to to list local galleries.')
+        self.import_status = tk.StringVar(
+            value='Scan Save-to to list local galleries (folders + top-level archives).'
+        )
         ttk.Label(parent, textvariable=self.import_status, padding=(8, 4)).pack(fill='x')
 
     def _build_duped_tab(self, parent: ttk.Frame):
@@ -2157,14 +2193,17 @@ class App(ttk.Frame):
         if row.get('match_title') or row.get('match_key'):
             key = row.get('match_key') or ''
             title = (row.get('match_title') or '')[:80]
+            ver = row.get('match_verify')
             match = f'{key} {title}'.strip()
+            if ver:
+                match = f'{match} [{ver}]'.strip()
             sc = row.get('match_score')
             if sc is not None:
                 score = f'{float(sc):.2f}'
         elif row.get('search_error'):
             match = f"err: {row['search_error'][:60]}"
         elif row.get('searched') and not row.get('match_key'):
-            match = '(no hit)'
+            match = '(no confirmed hit)'
         return (
             row.get('name') or '',
             str(row.get('files') or 0),
@@ -2195,50 +2234,188 @@ class App(ttk.Frame):
             self.import_tree.delete(iid)
         self._import_rows.clear()
 
-        folders = scan_gallery_folders(root)
-        for folder in folders:
-            st = {}
-            if self.store:
-                try:
-                    st = self.store.local_folder_status(folder)
-                except Exception as e:
-                    self.ui_log(f'Import status failed: {e}')
-            files = list_images(folder)
-            row = {
-                'path': str(folder),
-                'name': folder.name,
-                'files': len(files),
-                'in_galleries': bool(st.get('in_galleries')),
-                'in_queue': bool(st.get('in_queue')),
-                'url': st.get('url'),
-                'gallery_key': st.get('gallery_key'),
-                'match_key': None,
-                'match_token': None,
-                'match_url': None,
-                'match_title': None,
-                'match_score': None,
-                'match_hits': [],
-                'searched': False,
-                'search_error': None,
-            }
-            # Pre-fill match from DB if known
-            if st.get('gallery') or st.get('queue'):
-                src = st.get('gallery') or st.get('queue') or {}
-                row['match_key'] = src.get('gallery_key')
-                row['match_url'] = src.get('url')
-                row['match_title'] = src.get('title') or folder.name
-                row['match_score'] = 1.0
+        self._import_busy = True
+        self._import_stop.clear()
+        self.import_status.set('Scanning Save-to (extract archives if needed)…')
+        threading.Thread(
+            target=self._import_scan_worker,
+            args=(root,),
+            daemon=True,
+        ).start()
+
+    def _import_scan_worker(self, root: Path):
+        ext_stats: dict = {}
+        rows: list[dict] = []
+        try:
+            def _progress(msg: str):
+                if self._lifecycle_alive:
+                    self.after(0, lambda m=msg: self.import_status.set(m))
+
+            ext_stats = extract_toplevel_archives(
+                root,
+                progress=_progress,
+                should_stop=lambda: (
+                    not self._lifecycle_alive or self._import_stop.is_set()
+                ),
+            )
+            for err in ext_stats.get('errors') or []:
+                self.ui_log(f'Import archive: {err}')
+            if ext_stats.get('extracted'):
+                self.ui_log(
+                    f"Import extracted {ext_stats['extracted']} archive(s) "
+                    f"(removed={ext_stats.get('removed', 0)}, "
+                    f"skipped={ext_stats.get('skipped', 0)}, "
+                    f"failed={ext_stats.get('failed', 0)})"
+                )
+
+            if not self._lifecycle_alive or self._import_stop.is_set():
+                return
+
+            if self._lifecycle_alive:
+                self.after(0, lambda: self.import_status.set('Listing gallery folders…'))
+
+            folders = scan_gallery_folders(root)
+            for folder in folders:
+                if not self._lifecycle_alive or self._import_stop.is_set():
+                    return
+                st = {}
+                if self.store:
+                    try:
+                        st = self.store.local_folder_status(folder)
+                    except Exception as e:
+                        self.ui_log(f'Import status failed: {e}')
+                files = list_images(folder)
+                row = {
+                    'path': str(folder),
+                    'name': folder.name,
+                    'files': len(files),
+                    'in_galleries': bool(st.get('in_galleries')),
+                    'in_queue': bool(st.get('in_queue')),
+                    'url': st.get('url'),
+                    'gallery_key': st.get('gallery_key'),
+                    'match_key': None,
+                    'match_token': None,
+                    'match_url': None,
+                    'match_title': None,
+                    'match_score': None,
+                    'match_hits': [],
+                    'searched': False,
+                    'search_error': None,
+                }
+                if st.get('gallery') or st.get('queue'):
+                    src = st.get('gallery') or st.get('queue') or {}
+                    row['match_key'] = src.get('gallery_key')
+                    row['match_url'] = src.get('url')
+                    row['match_title'] = src.get('title') or folder.name
+                    row['match_score'] = 1.0
+                rows.append(row)
+        except Exception as e:
+            self.ui_log(f'Import scan failed: {e}')
+            log.exception('import scan failed: %s', e)
+        finally:
+            self._import_busy = False
+            if self._lifecycle_alive:
+                self.after(
+                    0,
+                    lambda r=rows, rt=root, es=ext_stats: self._import_scan_apply(
+                        r, rt, es
+                    ),
+                )
+
+    def _import_scan_apply(self, rows: list[dict], root: Path, ext_stats: dict):
+        if not self._lifecycle_alive:
+            return
+        for iid in self.import_tree.get_children():
+            self.import_tree.delete(iid)
+        self._import_rows.clear()
+        for row in rows:
             iid = self.import_tree.insert('', 'end', values=self._import_row_values(row))
             self._import_rows[iid] = row
 
-        msg = f'Scanned {len(folders)} gallery folder(s) under {root}'
+        extracted = int((ext_stats or {}).get('extracted') or 0)
+        failed = int((ext_stats or {}).get('failed') or 0)
+        msg = f'Scanned {len(rows)} gallery folder(s) under {root}'
+        if extracted or failed:
+            msg += f' (archives: extracted={extracted}, failed={failed})'
+        if self._import_stop.is_set():
+            msg += ' (stopped)'
         self.import_status.set(msg)
         self.ui_log(msg)
-        log_feed(log, logging.INFO, 'Import scan: %s folder(s)', len(folders))
+        log_feed(
+            log,
+            logging.INFO,
+            'Import scan: %s folder(s) (extracted=%s failed=%s)',
+            len(rows),
+            extracted,
+            failed,
+        )
 
     def import_stop_search(self):
         self._import_stop.set()
         self.import_status.set('Stopping search…')
+
+    def _import_ui_after_enqueue(self, url: str, iid: str):
+        """UI-thread: listbox insert + import row refresh after search auto-queue."""
+        if not self._lifecycle_alive:
+            return
+        key = gallery_key_from_url(url)
+        if key and not any(gallery_key_from_url(u) == key for u in self._queue_urls):
+            self._insert_queue_url(url, source='manual')
+            if self._worker and self._worker.is_alive():
+                self.job_queue.put(url)
+            self._refresh_idle_status()
+        self._import_refresh_row(iid)
+
+    def _import_ask_sha_confirm(
+        self, folder_name: str, candidates: list[dict]
+    ) -> dict | None:
+        """UI-thread: ask whether to accept an f_shash sample suggestion."""
+        if not candidates or not self._lifecycle_alive:
+            return None
+        lines = []
+        for i, c in enumerate(candidates[:5], 1):
+            votes = c.get('votes')
+            of = c.get('vote_of')
+            title = (c.get('title') or '')[:90]
+            lines.append(
+                f"{i}. {c.get('gallery_key')}  "
+                f"({votes}/{of} samples)  {title}"
+            )
+        best = candidates[0]
+        msg = (
+            f'No title match for:\n{folder_name}\n\n'
+            f'SHA sample suggests:\n'
+            + '\n'.join(lines)
+            + f"\n\nAccept #1 ({best.get('gallery_key')}) as this folder?"
+        )
+        if messagebox.askyesno('Import SHA match', msg):
+            return best
+        return None
+
+    def _import_confirm_sha_on_ui(
+        self, folder_name: str, candidates: list[dict]
+    ) -> dict | None:
+        """Marshal SHA confirm dialog to the UI thread; wait for answer."""
+        box: dict = {'hit': None}
+        done = threading.Event()
+
+        def ask():
+            try:
+                if self._lifecycle_alive:
+                    box['hit'] = self._import_ask_sha_confirm(
+                        folder_name, candidates
+                    )
+            finally:
+                done.set()
+
+        try:
+            self.after(0, ask)
+        except tk.TclError:
+            return None
+        while not done.wait(0.25):
+            if not self._lifecycle_alive or self._import_stop.is_set():
+                return None
+        return box.get('hit')
 
     def import_search_selected(self):
         iids = self._import_selected_iids()
@@ -2250,12 +2427,10 @@ class App(ttk.Frame):
     def import_search_unmatched(self):
         iids = [
             iid for iid, row in self._import_rows.items()
-            if not row.get('in_galleries')
-            and not row.get('match_key')
-            and not row.get('in_queue')
+            if not row.get('in_galleries') and not row.get('in_queue')
         ]
         if not iids:
-            messagebox.showinfo('Import', 'No unmatched folders to search.')
+            messagebox.showinfo('Import', 'No unmatched folders to search/queue.')
             return
         self._start_import_search(iids)
 
@@ -2274,10 +2449,47 @@ class App(ttk.Frame):
             daemon=True,
         ).start()
 
+    def _import_auto_enqueue_row(self, row: dict, iid: str) -> bool:
+        """Enqueue a matched import row (DB + UI). Returns True if newly queued."""
+        if not self.store:
+            return False
+        url = (row.get('match_url') or '').strip()
+        key = row.get('match_key') or gallery_key_from_url(url)
+        if not url or not key:
+            return False
+        try:
+            if self.store.is_completed_key(key):
+                row['in_galleries'] = True
+                return False
+            if self.store.is_queued_key(key):
+                row['in_queue'] = True
+                try:
+                    self.store.set_gallery_meta(url, out_dir=row.get('path'))
+                except Exception:
+                    pass
+                self.after(
+                    0, lambda u=url, i=iid: self._import_ui_after_enqueue(u, i)
+                )
+                return False
+            self.store.enqueue(url, source='manual')
+            self.store.set_gallery_meta(
+                url,
+                title=row.get('match_title') or row.get('name'),
+                out_dir=row.get('path'),
+            )
+            row['in_queue'] = True
+            self.after(0, lambda u=url, i=iid: self._import_ui_after_enqueue(u, i))
+            self.ui_log(f"Import queued: {key} ← {(row.get('name') or '')[:50]!r}")
+            return True
+        except Exception as e:
+            self.ui_log(f'Import auto-queue failed: {e}')
+            return False
+
     def _import_search_worker(self, iids: list[str]):
         session = default_session()
         total = len(iids)
         done = 0
+        queued = 0
         try:
             for i, iid in enumerate(iids):
                 if not self._lifecycle_alive or self._import_stop.is_set():
@@ -2286,6 +2498,58 @@ class App(ttk.Frame):
                 if not row:
                     continue
                 name = row.get('name') or ''
+                folder = Path(row.get('path') or '')
+
+                # Already matched — re-verify against local files, then queue.
+                if row.get('match_url') and row.get('match_key'):
+                    try:
+                        checked = verify_hit_against_folder(
+                            session,
+                            folder,
+                            {
+                                'gallery_key': row.get('match_key'),
+                                'token': row.get('match_token'),
+                                'url': row.get('match_url'),
+                                'title': row.get('match_title'),
+                                'score': row.get('match_score'),
+                            },
+                        )
+                    except Exception as e:
+                        row['search_error'] = str(e)
+                        self.ui_log(f'Import verify error ({name[:40]}): {e}')
+                        done += 1
+                        try:
+                            self.after(0, lambda i=iid: self._import_refresh_row(i))
+                        except tk.TclError:
+                            break
+                        continue
+                    row['match_verify'] = checked.get('verify')
+                    if checked.get('title'):
+                        row['match_title'] = checked['title']
+                    if checked.get('image_total'):
+                        row['match_image_total'] = checked['image_total']
+                    if not checked.get('verified'):
+                        self.ui_log(
+                            f"Import verify reject: {name[:50]!r} — "
+                            f"{checked.get('verify')}"
+                        )
+                        row['match_key'] = None
+                        row['match_url'] = None
+                        row['match_title'] = None
+                        row['match_score'] = None
+                    elif self._import_auto_enqueue_row(row, iid):
+                        queued += 1
+                        self.ui_log(
+                            f"Import verified {row['match_key']}: "
+                            f"{checked.get('verify')}"
+                        )
+                    done += 1
+                    try:
+                        self.after(0, lambda i=iid: self._import_refresh_row(i))
+                    except tk.TclError:
+                        break
+                    continue
+
                 try:
                     self.after(
                         0,
@@ -2308,6 +2572,7 @@ class App(ttk.Frame):
                     hits, query = search_by_folder_name(
                         session,
                         name,
+                        folder=folder if folder.is_dir() else None,
                         interval=SEARCH_INTERVAL,
                         should_stop=lambda: (
                             not self._lifecycle_alive or self._import_stop.is_set()
@@ -2323,24 +2588,101 @@ class App(ttk.Frame):
                         row['match_url'] = best.get('url')
                         row['match_title'] = best.get('title')
                         row['match_score'] = best.get('score')
-                        # Cross-check queue / DB by matched gid
-                        if self.store and row['match_key']:
-                            try:
-                                key = row['match_key']
-                                row['in_galleries'] = self.store.is_completed_key(key)
-                                row['in_queue'] = self.store.is_queued_key(key)
-                            except Exception:
-                                pass
+                        row['match_verify'] = best.get('verify')
+                        row['match_image_total'] = best.get('image_total')
                         self.ui_log(
                             f"Import match: {name[:60]!r} → {row['match_key']} "
-                            f"(q={query!r})"
+                            f"[{best.get('verify') or 'title'}] (q={query!r})"
                         )
+                        if self._import_auto_enqueue_row(row, iid):
+                            queued += 1
                     else:
-                        row['match_key'] = None
-                        row['match_url'] = None
-                        row['match_title'] = None
-                        row['match_score'] = None
-                        self.ui_log(f'Import no hit: {name[:60]!r}')
+                        # Title miss → sample ~3 files via f_shash, ask user.
+                        sha_hits: list[dict] = []
+                        if folder.is_dir():
+                            try:
+                                self.after(
+                                    0,
+                                    lambda n=name[:50]: self.import_status.set(
+                                        f'SHA fallback… {n}'
+                                    ),
+                                )
+                            except tk.TclError:
+                                break
+                            sha_hits = search_by_sample_shash(
+                                session,
+                                folder,
+                                interval=SEARCH_INTERVAL,
+                                should_stop=lambda: (
+                                    not self._lifecycle_alive
+                                    or self._import_stop.is_set()
+                                ),
+                            )
+                        if sha_hits:
+                            self.ui_log(
+                                f"Import SHA candidates for {name[:50]!r}: "
+                                + ', '.join(
+                                    f"{h.get('gallery_key')}({h.get('votes')}/"
+                                    f"{h.get('vote_of')})"
+                                    for h in sha_hits[:5]
+                                )
+                            )
+                            chosen = self._import_confirm_sha_on_ui(name, sha_hits)
+                            if chosen and self._lifecycle_alive:
+                                # Optional count/name enrich; user already confirmed.
+                                try:
+                                    checked = verify_hit_against_folder(
+                                        session, folder, chosen
+                                    )
+                                    if checked.get('title'):
+                                        chosen['title'] = checked['title']
+                                    if checked.get('verify'):
+                                        chosen['verify'] = (
+                                            f"{chosen.get('verify')}; "
+                                            f"{checked.get('verify')}"
+                                        )
+                                    chosen['image_total'] = checked.get(
+                                        'image_total'
+                                    )
+                                except Exception as e:
+                                    self.ui_log(
+                                        f'Import SHA post-check: {e}'
+                                    )
+                                row['match_key'] = chosen.get('gallery_key')
+                                row['match_token'] = chosen.get('token')
+                                row['match_url'] = chosen.get('url')
+                                row['match_title'] = chosen.get('title')
+                                row['match_score'] = chosen.get('score')
+                                row['match_verify'] = chosen.get('verify')
+                                row['match_image_total'] = chosen.get(
+                                    'image_total'
+                                )
+                                row['match_hits'] = sha_hits
+                                self.ui_log(
+                                    f"Import SHA accepted: {name[:50]!r} → "
+                                    f"{row['match_key']} [{row.get('match_verify')}]"
+                                )
+                                if self._import_auto_enqueue_row(row, iid):
+                                    queued += 1
+                            else:
+                                row['match_key'] = None
+                                row['match_url'] = None
+                                row['match_title'] = None
+                                row['match_score'] = None
+                                row['match_verify'] = None
+                                row['match_hits'] = sha_hits
+                                self.ui_log(
+                                    f'Import SHA declined: {name[:60]!r}'
+                                )
+                        else:
+                            row['match_key'] = None
+                            row['match_url'] = None
+                            row['match_title'] = None
+                            row['match_score'] = None
+                            row['match_verify'] = None
+                            self.ui_log(
+                                f'Import no confirmed hit: {name[:60]!r}'
+                            )
                 except Exception as e:
                     row['searched'] = True
                     row['search_error'] = str(e)
@@ -2356,8 +2698,8 @@ class App(ttk.Frame):
                 try:
                     self.after(
                         0,
-                        lambda d=done, t=total: self.import_status.set(
-                            f'Search done — {d}/{t}'
+                        lambda d=done, t=total, q=queued: self.import_status.set(
+                            f'Search done — {d}/{t}, queued {q}'
                             + (' (stopped)' if self._import_stop.is_set() else '')
                         ),
                     )
@@ -2988,7 +3330,9 @@ class App(ttk.Frame):
                 )
                 if self.store:
                     try:
-                        self.store.mark_running(url, out_dir=out_dir)
+                        # Do not pass Save-to root here — that would overwrite an
+                        # Import folder path. parse_gallery sets the real out_dir.
+                        self.store.mark_running(url)
                     except Exception as e:
                         self.ui_log(f'DB mark_running failed: {e}')
                 dl = EHDownloader(

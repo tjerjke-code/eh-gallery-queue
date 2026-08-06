@@ -6,7 +6,12 @@ Shared by the Import UI and ``tools/backfill_pics.py``.
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
+import shutil
+import subprocess
+import zipfile
+from collections.abc import Callable
 from pathlib import Path
 
 from db import (
@@ -19,6 +24,12 @@ from db import (
 
 SKIP_DIRS = {".Sort", ".sort"}
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
+# Top-level archives under Save-to are extracted to a folder named after the stem.
+ZIP_ARCHIVE_EXT = {".zip", ".cbz"}
+SEVEN_Z_ARCHIVE_EXT = {".rar", ".cbr", ".7z"}
+ARCHIVE_EXT = ZIP_ARCHIVE_EXT | SEVEN_Z_ARCHIVE_EXT
+
+log = logging.getLogger("EHGalleryQueue.local_import")
 
 
 def sha1_file(path: Path, chunk: int = 1024 * 1024) -> bytes:
@@ -47,6 +58,172 @@ def list_images(folder: Path) -> list[Path]:
         if p.suffix.lower() in IMAGE_EXT:
             out.append(p)
     return out
+
+
+def is_archive(path: Path) -> bool:
+    return path.is_file() and path.suffix.lower() in ARCHIVE_EXT
+
+
+def _find_7z() -> Path | None:
+    for name in ("7z", "7z.exe"):
+        found = shutil.which(name)
+        if found:
+            return Path(found)
+    for candidate in (
+        Path(r"C:\Program Files\7-Zip\7z.exe"),
+        Path(r"C:\Program Files (x86)\7-Zip\7z.exe"),
+    ):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _safe_zip_members(zf: zipfile.ZipFile, dest: Path) -> list[zipfile.ZipInfo]:
+    """Reject Zip Slip paths; return members safe to extract under ``dest``."""
+    dest_res = dest.resolve()
+    safe: list[zipfile.ZipInfo] = []
+    for info in zf.infolist():
+        target = (dest / info.filename).resolve()
+        try:
+            target.relative_to(dest_res)
+        except ValueError as e:
+            raise ValueError(f"unsafe path in archive: {info.filename!r}") from e
+        safe.append(info)
+    return safe
+
+
+def _unwrap_single_child_dir(dest: Path) -> None:
+    """If extract produced one subfolder and no top-level images, lift contents up."""
+    try:
+        children = [p for p in dest.iterdir() if p.name not in SKIP_DIRS]
+    except OSError:
+        return
+    if list_images(dest):
+        return
+    subdirs = [p for p in children if p.is_dir()]
+    files = [p for p in children if p.is_file()]
+    if len(subdirs) != 1 or files:
+        return
+    inner = subdirs[0]
+    try:
+        for item in list(inner.iterdir()):
+            target = dest / item.name
+            if target.exists():
+                continue
+            item.rename(target)
+        # Remove empty leftovers (ignore non-empty / locked).
+        for leftover in list(inner.iterdir()):
+            if leftover.is_file():
+                leftover.unlink(missing_ok=True)
+        inner.rmdir()
+    except OSError:
+        pass
+
+
+def _extract_zip_archive(archive: Path, dest: Path) -> None:
+    dest.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(archive, "r") as zf:
+        members = _safe_zip_members(zf, dest)
+        zf.extractall(dest, members=members)
+    _unwrap_single_child_dir(dest)
+
+
+def _extract_with_7z(archive: Path, dest: Path, seven_z: Path) -> None:
+    dest.mkdir(parents=True, exist_ok=True)
+    # eXtract with full paths into dest; -y = assume Yes on prompts.
+    proc = subprocess.run(
+        [str(seven_z), "x", str(archive), f"-o{dest}", "-y", "-bso0", "-bsp0"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "").strip() or f"exit {proc.returncode}"
+        raise RuntimeError(f"7z failed: {err[:200]}")
+    _unwrap_single_child_dir(dest)
+
+
+def extract_toplevel_archives(
+    root: Path,
+    *,
+    progress: Callable[[str], None] | None = None,
+    should_stop: Callable[[], bool] | None = None,
+) -> dict:
+    """Extract top-level archives under ``root`` into folders named after each stem.
+
+    Skips an archive when a same-named folder already contains images.
+    Returns counts: extracted / skipped / failed / errors.
+    """
+    root = Path(root)
+    stats: dict = {
+        "extracted": 0,
+        "removed": 0,
+        "skipped": 0,
+        "failed": 0,
+        "errors": [],
+    }
+    if not root.is_dir():
+        return stats
+
+    archives = sorted(
+        (p for p in root.iterdir() if is_archive(p)),
+        key=lambda p: p.name.lower(),
+    )
+    if not archives:
+        return stats
+
+    seven_z = _find_7z()
+    total = len(archives)
+    for i, archive in enumerate(archives, start=1):
+        if should_stop and should_stop():
+            break
+        name = archive.stem
+        dest = root / name
+        if progress:
+            progress(f"Extracting archive {i}/{total}: {archive.name[:60]}")
+
+        if dest.is_dir() and list_images(dest):
+            stats["skipped"] += 1
+            continue
+        if dest.exists() and not dest.is_dir():
+            msg = f"skip {archive.name}: path exists and is not a folder"
+            stats["failed"] += 1
+            stats["errors"].append(msg)
+            log.warning(msg)
+            continue
+
+        ext = archive.suffix.lower()
+        try:
+            if ext in ZIP_ARCHIVE_EXT:
+                _extract_zip_archive(archive, dest)
+            elif ext in SEVEN_Z_ARCHIVE_EXT:
+                if seven_z is None:
+                    raise RuntimeError(
+                        "need 7-Zip (7z.exe) on PATH or in Program Files for "
+                        f"{ext} archives"
+                    )
+                _extract_with_7z(archive, dest, seven_z)
+            else:
+                raise RuntimeError(f"unsupported archive type: {ext}")
+
+            if not list_images(dest):
+                raise RuntimeError("no images after extract")
+            stats["extracted"] += 1
+            log.info("Extracted archive %s → %s/", archive.name, name)
+            try:
+                archive.unlink()
+                stats["removed"] += 1
+            except OSError as e:
+                msg = f"could not delete {archive.name}: {e}"
+                stats["errors"].append(msg)
+                log.warning(msg)
+        except Exception as e:
+            stats["failed"] += 1
+            err = f"{archive.name}: {e}"
+            stats["errors"].append(err)
+            log.warning("Archive extract failed: %s", err)
+
+    return stats
 
 
 def scan_gallery_folders(root: Path) -> list[Path]:
