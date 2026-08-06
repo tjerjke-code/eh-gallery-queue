@@ -29,12 +29,16 @@ from fs_links import (
 from image_dhash import DEFAULT_MAX_HAMMING
 from local_import import list_images, nat_key
 from logger import get_logger, log_feed
+from name_pattern import family_key, filter_seq_by_family
+from set_siblings import suggest_set_siblings
 
 log = get_logger("duped_tab")
 
 DUPED_COLOR_LEFT = "#2B6CB0"
 DUPED_COLOR_RIGHT = "#C05621"
 DUPED_COLOR_FOCUS = "#ECC94B"
+DUPED_COLOR_SIBLING = "#FFF3CD"
+DUPED_COLOR_SIBLING_FG = "#856404"
 DUPED_NEIGHBOR_RADIUS = 3
 DUPED_THUMB_SIZE = 86
 DUPED_COMPARE_SIZE = 220
@@ -292,6 +296,13 @@ class DupedTab(ttk.Frame):
             text='  (hover preview \u00b7 double-click \u2192 compare session)',
             foreground='#666666',
         ).pack(side='left', padx=8)
+        tk.Label(
+            legend,
+            text='  set sibling?  ',
+            fg=DUPED_COLOR_SIBLING_FG,
+            bg=DUPED_COLOR_SIBLING,
+            font=('Segoe UI', 8, 'bold'),
+        ).pack(side='left', padx=(8, 0))
 
         tree_wrap = ttk.Frame(right)
         tree_wrap.pack(fill='both', expand=True)
@@ -301,6 +312,11 @@ class DupedTab(ttk.Frame):
             show='headings',
             selectmode='extended',
             height=10,
+        )
+        self.duped_file_tree.tag_configure(
+            'set_sibling',
+            background=DUPED_COLOR_SIBLING,
+            foreground=DUPED_COLOR_SIBLING_FG,
         )
         self._duped_bind_sortable_headings(
             self.duped_file_tree,
@@ -1480,8 +1496,20 @@ class DupedTab(ttk.Frame):
             return
         iid = sel[0]
         item = self._duped_files.get(iid)
-        if item:
-            self._duped_open_session(item)
+        if not item:
+            return
+        if item.get('kind') == 'set_sibling':
+            messagebox.showinfo(
+                'Duped',
+                'Set-sibling hint (no SHA peer).\n\n'
+                f'{item.get("source_name") or "?"}\n'
+                f'\u2192 {item.get("suggested_home_name") or "?"}\n'
+                f'({item.get("sibling_reason") or "cluster gap"})\n\n'
+                'Select the row and use Move to home to pull it into the '
+                'dedicated set (preferred home).',
+            )
+            return
+        self._duped_open_session(item)
 
     def _duped_show_compare(self, item: dict):
         """Open compare session for this match item."""
@@ -1495,14 +1523,14 @@ class DupedTab(ttk.Frame):
         if not peer_key:
             messagebox.showinfo('Duped', 'No peer gallery for this row.')
             return
-        left_seq = self._duped_sequence(focus_key)
-        right_seq = self._duped_sequence(peer_key)
-        left_idx = self._duped_index_in_seq(left_seq, item, focus_key)
-        right_idx = self._duped_index_in_seq(right_seq, item, peer_key)
+        left_full = self._duped_sequence(focus_key)
+        right_full = self._duped_sequence(peer_key)
+        left_idx = self._duped_index_in_seq(left_full, item, focus_key)
+        right_idx = self._duped_index_in_seq(right_full, item, peer_key)
         # Match-group peer may use a different SHA than the local row.
         peer_sha = item.get('peer_sha1')
-        if right_idx is None and peer_sha and right_seq:
-            for i, slot in enumerate(right_seq):
+        if right_idx is None and peer_sha and right_full:
+            for i, slot in enumerate(right_full):
                 if slot.get('sha1') == peer_sha:
                     right_idx = i
                     break
@@ -1513,15 +1541,61 @@ class DupedTab(ttk.Frame):
             )
             return
         if right_idx is None:
-            right_idx = min(left_idx, max(0, len(right_seq) - 1)) if right_seq else 0
+            right_idx = (
+                min(left_idx, max(0, len(right_full) - 1)) if right_full else 0
+            )
+
+        left_name = (left_full[left_idx].get('name') or '') if left_full else ''
+        right_name = (
+            (right_full[right_idx].get('name') or '') if right_full else ''
+        )
+        left_fam = family_key(left_name)
+        right_fam = family_key(right_name)
+        # Narrow walk to same set-id on each side when both names have a pattern.
+        if left_fam and right_fam:
+            walk_left = filter_seq_by_family(left_full, left_fam)
+            walk_right = filter_seq_by_family(right_full, right_fam)
+            pattern_mode = True
+        else:
+            walk_left = list(left_full)
+            walk_right = list(right_full)
+            pattern_mode = False
+            left_fam = None
+            right_fam = None
+
+        def _idx_in_walk(walk: list[dict], full_idx: int, full: list[dict]) -> int:
+            if not walk or not full or not (0 <= full_idx < len(full)):
+                return 0
+            target = full[full_idx]
+            for i, slot in enumerate(walk):
+                if slot is target or (
+                    slot.get('name') == target.get('name')
+                    and slot.get('sha1') == target.get('sha1')
+                ):
+                    return i
+            # Fallback: match by name only.
+            tname = target.get('name')
+            for i, slot in enumerate(walk):
+                if slot.get('name') == tname:
+                    return i
+            return 0
+
+        wl = _idx_in_walk(walk_left, left_idx, left_full)
+        wr = _idx_in_walk(walk_right, right_idx, right_full)
+
         self._session = {
             'focus_key': focus_key,
             'peer_key': peer_key,
-            'left_idx': int(left_idx),
-            'right_idx': int(right_idx),
-            'anchor_left': int(left_idx),
-            'anchor_right': int(right_idx),
+            'walk_left': walk_left,
+            'walk_right': walk_right,
+            'left_idx': int(wl),
+            'right_idx': int(wr),
+            'anchor_left': int(wl),
+            'anchor_right': int(wr),
             'nav_dir': 1,
+            'pattern_mode': pattern_mode,
+            'left_family': left_fam,
+            'right_family': right_fam,
             'seed_item': item,
             'staged_same': set(),
             'staged_fp': set(),
@@ -1663,6 +1737,18 @@ class DupedTab(ttk.Frame):
         }
         self._duped_compare_win_photos = []
 
+    def _duped_session_walks(self) -> tuple[list[dict], list[dict]]:
+        sess = self._session
+        if not sess:
+            return [], []
+        left = sess.get('walk_left')
+        right = sess.get('walk_right')
+        if left is None:
+            left = self._duped_sequence(sess['focus_key'])
+        if right is None:
+            right = self._duped_sequence(sess['peer_key'])
+        return left, right
+
     def _duped_session_current_shas(self) -> tuple[bytes | None, bytes | None]:
         sess = self._session
         if not sess:
@@ -1672,11 +1758,7 @@ class DupedTab(ttk.Frame):
     def _duped_session_shas_at(
         self, left_idx: int, right_idx: int
     ) -> tuple[bytes | None, bytes | None]:
-        sess = self._session
-        if not sess:
-            return None, None
-        left_seq = self._duped_sequence(sess['focus_key'])
-        right_seq = self._duped_sequence(sess['peer_key'])
+        left_seq, right_seq = self._duped_session_walks()
         sha_l = left_seq[left_idx].get('sha1') if 0 <= left_idx < len(left_seq) else None
         sha_r = (
             right_seq[right_idx].get('sha1') if 0 <= right_idx < len(right_seq) else None
@@ -1684,12 +1766,11 @@ class DupedTab(ttk.Frame):
         return sha_l, sha_r
 
     def _duped_session_slice_left_range(self) -> tuple[int, int] | None:
-        """Inclusive left-index range ``[lo, hi]`` where both sides stay in bounds."""
+        """Inclusive left-index range ``[lo, hi]`` where both walk sides stay in bounds."""
         sess = self._session
         if not sess:
             return None
-        left_seq = self._duped_sequence(sess['focus_key'])
-        right_seq = self._duped_sequence(sess['peer_key'])
+        left_seq, right_seq = self._duped_session_walks()
         if not left_seq or not right_seq:
             return None
         offset = int(sess['anchor_left']) - int(sess['anchor_right'])
@@ -1701,15 +1782,14 @@ class DupedTab(ttk.Frame):
         return lo, hi_excl - 1
 
     def _duped_session_nav(self, delta: int) -> bool:
-        """Move both sides by ``delta``. Returns False if blocked at an edge."""
+        """Move both sides by ``delta`` within the walk slice. False at an edge."""
         sess = self._session
         if not sess:
             return False
         d = int(delta)
         if d:
             sess['nav_dir'] = 1 if d > 0 else -1
-        left_seq = self._duped_sequence(sess['focus_key'])
-        right_seq = self._duped_sequence(sess['peer_key'])
+        left_seq, right_seq = self._duped_session_walks()
         if not left_seq and not right_seq:
             return False
         new_l = sess['left_idx'] + d
@@ -2006,8 +2086,7 @@ class DupedTab(ttk.Frame):
             return
         focus_key = sess['focus_key']
         peer_key = sess['peer_key']
-        left_seq = self._duped_sequence(focus_key)
-        right_seq = self._duped_sequence(peer_key)
+        left_seq, right_seq = self._duped_session_walks()
         li, ri = sess['left_idx'], sess['right_idx']
         left_slot = left_seq[li] if 0 <= li < len(left_seq) else {}
         right_slot = right_seq[ri] if 0 <= ri < len(right_seq) else {}
@@ -2030,9 +2109,17 @@ class DupedTab(ttk.Frame):
         off_r = ri - sess['anchor_right']
         n_same = len(sess['staged_same'])
         n_fp = len(sess['staged_fp'])
+        if sess.get('pattern_mode'):
+            pat = (
+                f'pattern {sess.get("left_family") or "?"} ↔ '
+                f'{sess.get("right_family") or "?"}  ·  '
+            )
+        else:
+            pat = 'full gallery  ·  '
         try:
             w['title'].configure(
                 text=(
+                    f'{pat}'
                     f'{focus_key} [{li + 1}/{max(1, len(left_seq))}]  ↔  '
                     f'{peer_key} [{ri + 1}/{max(1, len(right_seq))}]  ·  '
                     f'offset {off_l:+d}/{off_r:+d}'
@@ -2091,7 +2178,10 @@ class DupedTab(ttk.Frame):
         win.protocol('WM_DELETE_WINDOW', self._duped_close_more_win)
         hint = tk.Label(
             win,
-            text='Click one This (blue) and one Peer (orange). Staged Same are hidden.',
+            text=(
+                'Click one This (blue) and one Peer (orange). Staged Same hidden. '
+                'Outside pattern widens walk to full gallery.'
+            ),
             fg='#ccc',
             bg='#1e1e1e',
             font=('Segoe UI', 9),
@@ -2231,8 +2321,44 @@ class DupedTab(ttk.Frame):
                 except Exception:
                     pass
             return
-        sess['left_idx'] = int(left_i)
-        sess['right_idx'] = int(right_i)
+        # More lists full gallery order; map into the current walk slices.
+        focus_key = sess['focus_key']
+        peer_key = sess['peer_key']
+        full_l = self._duped_sequence(focus_key)
+        full_r = self._duped_sequence(peer_key)
+        if not (0 <= left_i < len(full_l) and 0 <= right_i < len(full_r)):
+            return
+        slot_l = full_l[left_i]
+        slot_r = full_r[right_i]
+        walk_l, walk_r = self._duped_session_walks()
+
+        def _find(walk: list[dict], slot: dict) -> int | None:
+            for i, s in enumerate(walk):
+                if s.get('name') == slot.get('name') and (
+                    s.get('sha1') == slot.get('sha1') or not slot.get('sha1')
+                ):
+                    return i
+            name = slot.get('name')
+            for i, s in enumerate(walk):
+                if s.get('name') == name:
+                    return i
+            return None
+
+        wl = _find(walk_l, slot_l)
+        wr = _find(walk_r, slot_r)
+        if wl is None or wr is None:
+            # Outside pattern slice — widen to full gallery for the rest of session.
+            sess['walk_left'] = list(full_l)
+            sess['walk_right'] = list(full_r)
+            sess['pattern_mode'] = False
+            sess['left_family'] = None
+            sess['right_family'] = None
+            wl = left_i
+            wr = right_i
+            sess['anchor_left'] = wl
+            sess['anchor_right'] = wr
+        sess['left_idx'] = int(wl)
+        sess['right_idx'] = int(wr)
         sess['more_pick_left'] = None
         sess['more_pick_right'] = None
         self._duped_close_more_win()
@@ -2502,6 +2628,127 @@ class DupedTab(ttk.Frame):
             self.duped_status.set(
                 f'{key}: {len(files)} shared ({mode}) — double-click compare session'
             )
+            self._duped_scan_set_siblings(gen, key)
+
+    def _duped_scan_set_siblings(self, gen: int, key: str):
+        """Background: find hole-fill orphans for dedicated-set home."""
+        if not self.store or self._duped_is_near():
+            return
+        store = self.store
+
+        def work():
+            if (
+                gen != self._duped_file_pop_gen
+                or not self._lifecycle_alive
+                or key != self._duped_focus_key
+            ):
+                return
+            try:
+                seed = store.list_shared_files_for_gallery(
+                    key, undecided_only=False
+                )
+            except Exception as e:
+                log.exception('set-sibling seed failed for %s', key)
+                self.ui_log(f'Set-sibling scan failed: {e}')
+                return
+
+            def resolve_path(sample_path, gallery_key, name):
+                real = resolve_real_file(sample_path)
+                if real is not None:
+                    return real
+                try:
+                    meta = store.resolve_gallery_meta(gallery_key)
+                except Exception:
+                    meta = None
+                out = (meta or {}).get('out_dir')
+                if out and name:
+                    return resolve_real_file(Path(out) / name)
+                return None
+
+            try:
+                siblings = suggest_set_siblings(
+                    seed,
+                    key,
+                    list_aliases_for_gallery=store.list_aliases_for_gallery,
+                    gallery_has_sha=store.gallery_has_sha,
+                    resolve_path=resolve_path,
+                )
+            except Exception as e:
+                log.exception('set-sibling suggest failed for %s', key)
+                self.ui_log(f'Set-sibling suggest failed: {e}')
+                return
+
+            def done():
+                if (
+                    gen != self._duped_file_pop_gen
+                    or not self._lifecycle_alive
+                    or key != self._duped_focus_key
+                ):
+                    return
+                self._duped_append_siblings(key, siblings)
+
+            self._ui_schedule(done)
+
+        threading.Thread(
+            target=work, name='duped-set-sib', daemon=True
+        ).start()
+
+    def _duped_append_siblings(self, key: str, siblings: list[dict]):
+        if not siblings:
+            return
+        existing = set(self._duped_files.keys())
+        added = 0
+        for item in siblings:
+            digest = item.get('sha1')
+            if not digest:
+                continue
+            iid = digest.hex() if isinstance(digest, bytes) else str(digest)
+            if iid in existing:
+                continue
+            local_name = item.get('_local_name') or item.get('suggested_home_name')
+            peer_key = item.get('_peer_key') or ''
+            peer_name = item.get('_peer_name') or item.get('source_name') or ''
+            peer_label = ''
+            if peer_key:
+                peer_label = (
+                    f'{peer_key}: {peer_name}' if peer_name else peer_key
+                )
+            home_col = item.get('preferred_home_key') or ''
+            reason = item.get('sibling_reason') or 'set sibling?'
+            this_path = item.get('_this_path') or f'({reason})'
+            peer_path = item.get('_peer_path') or ''
+            self._duped_files[iid] = item
+            existing.add(iid)
+            try:
+                self.duped_file_tree.insert(
+                    '',
+                    0,
+                    iid=iid,
+                    tags=('set_sibling',),
+                    values=(
+                        local_name or iid[:12],
+                        this_path,
+                        peer_label,
+                        peer_path,
+                        home_col,
+                    ),
+                )
+                added += 1
+            except tk.TclError:
+                pass
+        if added:
+            cur = self.duped_status.get() if hasattr(self, 'duped_status') else ''
+            self.duped_status.set(
+                f'{cur} · {added} set-sibling hint(s)' if cur else
+                f'{key}: {added} set-sibling hint(s)'
+            )
+            log_feed(
+                log,
+                logging.INFO,
+                'Duped %s: %s set-sibling hint(s)',
+                key,
+                added,
+            )
 
 
     def _duped_file_iids(self, *, scope: str) -> list[str]:
@@ -2522,22 +2769,7 @@ class DupedTab(ttk.Frame):
         if not gsel:
             messagebox.showinfo('Duped', 'Select a home gallery on the left.')
             return
-        home_key = gsel[0]
-        home_row = self._duped_rows.get(home_key) or {}
-        home_dir = home_row.get('out_dir')
-        if not home_dir:
-            gal = None
-            try:
-                gal = self.store.resolve_gallery_meta(home_key)
-            except Exception:
-                pass
-            home_dir = (gal or {}).get('out_dir')
-        if not home_dir:
-            messagebox.showwarning(
-                'Duped',
-                f'No out_dir for gallery {home_key}. Complete/import it first.',
-            )
-            return
+        focus_home = gsel[0]
 
         fsel = self._duped_file_iids(scope=scope)
         if not fsel:
@@ -2552,42 +2784,81 @@ class DupedTab(ttk.Frame):
             return
 
         items = [self._duped_files[i] for i in fsel if i in self._duped_files]
+        # Set-sibling rows prefer the dedicated-set gallery as home.
+        by_home: dict[str, list[dict]] = {}
+        for item in items:
+            hk = (item.get('preferred_home_key') or focus_home).strip()
+            by_home.setdefault(hk, []).append(item)
+
+        home_dirs: dict[str, Path] = {}
+        for hk in by_home:
+            home_row = self._duped_rows.get(hk) or {}
+            home_dir = home_row.get('out_dir')
+            if not home_dir:
+                gal = None
+                try:
+                    gal = self.store.resolve_gallery_meta(hk)
+                except Exception:
+                    pass
+                home_dir = (gal or {}).get('out_dir')
+            if not home_dir:
+                messagebox.showwarning(
+                    'Duped',
+                    f'No out_dir for gallery {hk}. Complete/import it first.',
+                )
+                return
+            home_dirs[hk] = Path(home_dir)
+
         create_links = bool(self.duped_links_var.get())
         n = len(items)
         scope_label = 'all listed' if scope == 'all' else 'selected'
         verb = 'move + link peers' if create_links else 'move without peer links'
+        sib_n = sum(1 for it in items if it.get('kind') == 'set_sibling')
+        home_bits = ', '.join(
+            f'{hk} ({len(v)})' for hk, v in by_home.items()
+        )
+        dest_lines = '\n'.join(str(p) for p in home_dirs.values())
+        extra = ''
+        if sib_n:
+            extra = (
+                f'\n{sib_n} set-sibling hint(s) → dedicated set home '
+                f'(rename to set pattern).'
+            )
         if not messagebox.askyesno(
             'Duped',
-            f'Move to home {home_key} — {n} {scope_label} file(s)\n'
-            f'({verb}).\n\n'
-            f'Destination:\n{home_dir}',
+            f'Move to home — {n} {scope_label} file(s)\n'
+            f'({verb}).\n'
+            f'Homes: {home_bits}{extra}\n\n'
+            f'Destination(s):\n{dest_lines}',
         ):
             return
 
         self._duped_busy = True
         self._duped_stop.clear()
-        self.duped_status.set(f'Applying home {home_key}…')
+        self.duped_status.set(f'Applying home…')
 
         def work():
             ok = 0
             fail = 0
             try:
-                for item in items:
-                    if self._duped_stop.is_set() or not self._lifecycle_alive:
-                        break
-                    try:
-                        self._duped_appoint_one(
-                            item,
-                            home_key=home_key,
-                            home_dir=Path(home_dir),
-                            create_links=create_links,
-                        )
-                        ok += 1
-                    except Exception as e:
-                        fail += 1
-                        self.ui_log(
-                            f"Duped move fail {item.get('sha1_hex', '')[:10]}: {e}"
-                        )
+                for hk, group in by_home.items():
+                    home_dir = home_dirs[hk]
+                    for item in group:
+                        if self._duped_stop.is_set() or not self._lifecycle_alive:
+                            break
+                        try:
+                            self._duped_appoint_one(
+                                item,
+                                home_key=hk,
+                                home_dir=home_dir,
+                                create_links=create_links,
+                            )
+                            ok += 1
+                        except Exception as e:
+                            fail += 1
+                            self.ui_log(
+                                f"Duped move fail {item.get('sha1_hex', '')[:10]}: {e}"
+                            )
             finally:
                 def done():
                     self._duped_busy = False
@@ -2599,8 +2870,7 @@ class DupedTab(ttk.Frame):
                     log_feed(
                         log,
                         logging.INFO,
-                        'Duped home %s — ok=%s fail=%s links=%s scope=%s',
-                        home_key,
+                        'Duped home apply — ok=%s fail=%s links=%s scope=%s',
                         ok,
                         fail,
                         create_links,
@@ -2816,11 +3086,15 @@ class DupedTab(ttk.Frame):
 
         # Preferred name in home gallery.
         home_name = None
-        for a in aliases:
-            if a.get('gallery_key') == home_key:
-                home_name = a.get('name') or a.get('bare_name')
-                if home_name:
-                    break
+        suggested = (item.get('suggested_home_name') or '').strip()
+        if suggested:
+            home_name = suggested
+        if not home_name:
+            for a in aliases:
+                if a.get('gallery_key') == home_key:
+                    home_name = a.get('name') or a.get('bare_name')
+                    if home_name:
+                        break
         if not home_name:
             home_name = Path(item.get('sample_path') or 'file.bin').name
 
@@ -2866,6 +3140,18 @@ class DupedTab(ttk.Frame):
                 if eq == digest:
                     raise
                 self.ui_log(f'  home meta for {eq.hex()[:10]}: {e}')
+
+        # Ensure home gallery has a name alias (set-sibling rename path).
+        try:
+            self.store.record_name_alias(
+                digest,
+                name=str(home_name),
+                bare_name=Path(str(home_name)).stem,
+                gallery_key=home_key,
+                sample_path=str(moved),
+            )
+        except Exception as e:
+            self.ui_log(f'  home alias {home_name}: {e}')
 
         # Peer sites: symlink or remove presence (aliases stay in DB).
         for a in aliases:

@@ -24,10 +24,14 @@ RELOAD_DEPS = (
     'eh_title_search',
     'local_import',
     'fs_links',
+    'name_pattern',
+    'set_siblings',
     'dhash_fill',
     'downloader',
+    'pixiv',
     'duped_tab',
     'import_tab',
+    'pixiv_tab',
     'app',
 )
 

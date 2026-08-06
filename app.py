@@ -3,7 +3,7 @@
 Owned by ``eh_gallery_queue.HotReloadShell``. Ctrl+R reloads this module
 and rebuilds :class:`App` without killing the process.
 
-Tab UIs: ``import_tab.ImportTab``, ``duped_tab.DupedTab``.
+Tab UIs: ``import_tab.ImportTab``, ``duped_tab.DupedTab``, ``pixiv_tab.PixivTab``.
 Download engine: ``downloader.EHDownloader``.
 """
 
@@ -25,6 +25,7 @@ from duped_tab import DupedTab
 from eh_hash_check import EhHashCheckWorker, clean_search_hit_title
 from import_tab import ImportTab
 from logger import get_logger, log_feed
+from pixiv_tab import PixivTab
 
 log = get_logger('app')
 
@@ -65,6 +66,7 @@ class App(ttk.Frame):
         self._ui_drain_alive = True
         self.duped: DupedTab | None = None
         self.import_tab: ImportTab | None = None
+        self.pixiv_tab: PixivTab | None = None
 
         # --- shared: Save to ---
         top = ttk.Frame(self, padding=8)
@@ -82,15 +84,19 @@ class App(ttk.Frame):
         queue_tab = ttk.Frame(nb)
         import_parent = ttk.Frame(nb)
         duped_parent = ttk.Frame(nb)
+        pixiv_parent = ttk.Frame(nb)
         nb.add(queue_tab, text='Queue')
         nb.add(import_parent, text='Import')
         nb.add(duped_parent, text='Duped')
+        nb.add(pixiv_parent, text='Pixiv')
 
         self._build_queue_tab(queue_tab)
         self.import_tab = ImportTab(import_parent, host=self)
         self.import_tab.pack(fill='both', expand=True)
         self.duped = DupedTab(duped_parent, host=self)
         self.duped.pack(fill='both', expand=True)
+        self.pixiv_tab = PixivTab(pixiv_parent, host=self)
+        self.pixiv_tab.pack(fill='both', expand=True)
 
         self.status = tk.StringVar(value='Idle')
         ttk.Label(self, textvariable=self.status, padding=8).pack(fill='x')
@@ -209,6 +215,11 @@ class App(ttk.Frame):
         if self.import_tab is not None:
             try:
                 self.import_tab.shutdown()
+            except Exception:
+                pass
+        if self.pixiv_tab is not None:
+            try:
+                self.pixiv_tab.shutdown()
             except Exception:
                 pass
         with self._ui_pending_lock:

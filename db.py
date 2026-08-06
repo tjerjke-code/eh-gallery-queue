@@ -631,6 +631,49 @@ class QueueStore:
             for r in rows
         ]
 
+    def list_aliases_for_gallery(self, gallery_key: str) -> list[dict]:
+        """All name aliases recorded under ``gallery_key`` (for set-sibling scan)."""
+        key = (gallery_key or "").strip()[:64]
+        if not key:
+            return []
+        with self._lock:
+            rows = self._conn().cursor().execute(
+                """
+                SELECT sha1, name, bare_name, gallery_key, sample_path
+                FROM dbo.image_name_aliases
+                WHERE gallery_key = ?
+                ORDER BY name ASC, id ASC
+                """,
+                key,
+            ).fetchall()
+        return [
+            {
+                "sha1": bytes(r[0]),
+                "name": r[1],
+                "bare_name": r[2],
+                "gallery_key": r[3] or "",
+                "sample_path": r[4],
+            }
+            for r in rows
+        ]
+
+    def gallery_has_sha(self, gallery_key: str, digest: bytes) -> bool:
+        """True if ``digest`` already has an alias under ``gallery_key``."""
+        key = (gallery_key or "").strip()[:64]
+        if not key or not digest or len(digest) != 20:
+            return False
+        with self._lock:
+            row = self._conn().cursor().execute(
+                """
+                SELECT TOP (1) 1
+                FROM dbo.image_name_aliases
+                WHERE gallery_key = ? AND sha1 = ?
+                """,
+                key,
+                digest,
+            ).fetchone()
+        return bool(row)
+
     def record_name_alias(
         self,
         digest: bytes,
@@ -2506,6 +2549,69 @@ class QueueStore:
             )
             # CASCADE deletes queue_images
             cur.execute("DELETE FROM dbo.queue_items WHERE gallery_key = ?", key)
+            self._conn().commit()
+
+    def upsert_gallery(
+        self,
+        gallery_key: str,
+        *,
+        url: str,
+        title: str | None = None,
+        out_dir: str | None = None,
+        image_total: int | None = None,
+        token: str | None = None,
+        saved: int = 0,
+        skipped: int = 0,
+        failed: int = 0,
+    ) -> None:
+        """Insert/update a ``galleries`` row by explicit key (EH or Pixiv)."""
+        key = (gallery_key or "").strip()[:64]
+        if not key:
+            return
+        with self._lock:
+            self._conn().cursor().execute(
+                """
+                MERGE dbo.galleries AS t
+                USING (
+                    SELECT
+                        ? AS gallery_key,
+                        ? AS token,
+                        ? AS url,
+                        ? AS title,
+                        ? AS out_dir,
+                        ? AS image_total,
+                        ? AS saved,
+                        ? AS skipped,
+                        ? AS failed
+                ) AS s
+                ON t.gallery_key = s.gallery_key
+                WHEN MATCHED THEN UPDATE SET
+                    token = COALESCE(s.token, t.token),
+                    url = COALESCE(NULLIF(s.url, N''), t.url),
+                    title = COALESCE(s.title, t.title),
+                    out_dir = COALESCE(s.out_dir, t.out_dir),
+                    image_total = COALESCE(s.image_total, t.image_total),
+                    saved = s.saved,
+                    skipped = s.skipped,
+                    failed = s.failed,
+                    completed_at = SYSUTCDATETIME()
+                WHEN NOT MATCHED THEN INSERT
+                    (gallery_key, token, url, title, out_dir,
+                     image_total, saved, skipped, failed)
+                VALUES
+                    (s.gallery_key, s.token, s.url, s.title, s.out_dir,
+                     s.image_total, s.saved, s.skipped, s.failed);
+                """,
+                key,
+                (token or None),
+                (url or "").strip()[:512],
+                (title or None),
+                (out_dir or None),
+                image_total,
+                int(saved),
+                int(skipped),
+                int(failed),
+            )
             self._conn().commit()
 
     def close(self) -> None:
