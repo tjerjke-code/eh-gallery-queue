@@ -13,11 +13,14 @@ from tkinter import messagebox, ttk
 from db import gallery_key_from_url
 from eh_hash_check import SEARCH_INTERVAL
 from eh_title_search import (
+    VERIFY_PAGE_INTERVAL,
     default_session,
+    enrich_sha_candidates,
     search_by_folder_name,
     search_by_sample_shash,
     verify_hit_against_folder,
 )
+from import_sha_compare import ask_sha_match, close_active_sha_compare
 from local_import import (
     extract_toplevel_archives,
     import_local_gallery,
@@ -62,6 +65,7 @@ class ImportTab(ttk.Frame):
 
     def shutdown(self) -> None:
         self._import_stop.set()
+        close_active_sha_compare()
 
     def _build(self):
         help_row = ttk.Frame(self, padding=(8, 6))
@@ -334,34 +338,27 @@ class ImportTab(ttk.Frame):
 
 
     def _import_ask_sha_confirm(
-        self, folder_name: str, candidates: list[dict]
+        self,
+        folder_name: str,
+        candidates: list[dict],
+        folder: Path | None = None,
     ) -> dict | None:
-        """UI-thread: ask whether to accept an f_shash sample suggestion."""
+        """UI-thread: gallery-style picker among f_shash suggestions."""
         if not candidates or not self._lifecycle_alive:
             return None
-        lines = []
-        for i, c in enumerate(candidates[:5], 1):
-            votes = c.get('votes')
-            of = c.get('vote_of')
-            title = (c.get('title') or '')[:90]
-            lines.append(
-                f"{i}. {c.get('gallery_key')}  "
-                f"({votes}/{of} samples)  {title}"
-            )
-        best = candidates[0]
-        msg = (
-            f'No title match for:\n{folder_name}\n\n'
-            f'SHA sample suggests:\n'
-            + '\n'.join(lines)
-            + f"\n\nAccept #1 ({best.get('gallery_key')}) as this folder?"
+        return ask_sha_match(
+            self.winfo_toplevel(),
+            folder_name,
+            folder,
+            candidates,
         )
-        if messagebox.askyesno('Import SHA match', msg):
-            return best
-        return None
 
 
     def _import_confirm_sha_on_ui(
-        self, folder_name: str, candidates: list[dict]
+        self,
+        folder_name: str,
+        candidates: list[dict],
+        folder: Path | None = None,
     ) -> dict | None:
         """Marshal SHA confirm dialog to the UI thread; wait for answer."""
         box: dict = {'hit': None}
@@ -371,7 +368,7 @@ class ImportTab(ttk.Frame):
             try:
                 if self._lifecycle_alive:
                     box['hit'] = self._import_ask_sha_confirm(
-                        folder_name, candidates
+                        folder_name, candidates, folder=folder
                     )
             finally:
                 done.set()
@@ -382,6 +379,7 @@ class ImportTab(ttk.Frame):
             return None
         while not done.wait(0.25):
             if not self._lifecycle_alive or self._import_stop.is_set():
+                close_active_sha_compare()
                 return None
         return box.get('hit')
 
@@ -607,53 +605,85 @@ class ImportTab(ttk.Frame):
                                     for h in sha_hits[:5]
                                 )
                             )
-                            chosen = self._import_confirm_sha_on_ui(name, sha_hits)
-                            if chosen and self._lifecycle_alive:
-                                # Optional count/name enrich; user already confirmed.
-                                try:
-                                    checked = verify_hit_against_folder(
-                                        session, folder, chosen
-                                    )
-                                    if checked.get('title'):
-                                        chosen['title'] = checked['title']
-                                    if checked.get('verify'):
-                                        chosen['verify'] = (
-                                            f"{chosen.get('verify')}; "
-                                            f"{checked.get('verify')}"
-                                        )
-                                    chosen['image_total'] = checked.get(
+                            try:
+                                self._ui_schedule(
+                                    lambda n=name[:50]: self.import_status.set(
+                                        f'SHA compare… {n}'
+                                    ),
+                                )
+                            except tk.TclError:
+                                break
+                            enriched = enrich_sha_candidates(
+                                session,
+                                folder,
+                                sha_hits[:5],
+                                interval=VERIFY_PAGE_INTERVAL,
+                                should_stop=lambda: (
+                                    not self._lifecycle_alive
+                                    or self._import_stop.is_set()
+                                ),
+                                fetch_images=True,
+                            )
+                            if not enriched or not self._lifecycle_alive:
+                                row['match_hits'] = sha_hits
+                                self.ui_log(
+                                    f'Import SHA enrich skipped: {name[:60]!r}'
+                                )
+                            else:
+                                chosen = self._import_confirm_sha_on_ui(
+                                    name, enriched, folder=folder
+                                )
+                                if chosen and self._lifecycle_alive:
+                                    # Enrich already fetched page meta; light refresh only
+                                    # when image_total / title missing.
+                                    if (
+                                        chosen.get('image_total') is None
+                                        or not chosen.get('title')
+                                    ):
+                                        try:
+                                            checked = verify_hit_against_folder(
+                                                session, folder, chosen
+                                            )
+                                            if checked.get('title'):
+                                                chosen['title'] = checked['title']
+                                            if checked.get('verify'):
+                                                chosen['verify'] = checked.get(
+                                                    'verify'
+                                                )
+                                            if checked.get('image_total') is not None:
+                                                chosen['image_total'] = checked.get(
+                                                    'image_total'
+                                                )
+                                        except Exception as e:
+                                            self.ui_log(
+                                                f'Import SHA post-check: {e}'
+                                            )
+                                    row['match_key'] = chosen.get('gallery_key')
+                                    row['match_token'] = chosen.get('token')
+                                    row['match_url'] = chosen.get('url')
+                                    row['match_title'] = chosen.get('title')
+                                    row['match_score'] = chosen.get('score')
+                                    row['match_verify'] = chosen.get('verify')
+                                    row['match_image_total'] = chosen.get(
                                         'image_total'
                                     )
-                                except Exception as e:
+                                    row['match_hits'] = enriched
                                     self.ui_log(
-                                        f'Import SHA post-check: {e}'
+                                        f"Import SHA accepted: {name[:50]!r} → "
+                                        f"{row['match_key']} [{row.get('match_verify')}]"
                                     )
-                                row['match_key'] = chosen.get('gallery_key')
-                                row['match_token'] = chosen.get('token')
-                                row['match_url'] = chosen.get('url')
-                                row['match_title'] = chosen.get('title')
-                                row['match_score'] = chosen.get('score')
-                                row['match_verify'] = chosen.get('verify')
-                                row['match_image_total'] = chosen.get(
-                                    'image_total'
-                                )
-                                row['match_hits'] = sha_hits
-                                self.ui_log(
-                                    f"Import SHA accepted: {name[:50]!r} → "
-                                    f"{row['match_key']} [{row.get('match_verify')}]"
-                                )
-                                if self._import_auto_enqueue_row(row, iid):
-                                    queued += 1
-                            else:
-                                row['match_key'] = None
-                                row['match_url'] = None
-                                row['match_title'] = None
-                                row['match_score'] = None
-                                row['match_verify'] = None
-                                row['match_hits'] = sha_hits
-                                self.ui_log(
-                                    f'Import SHA declined: {name[:60]!r}'
-                                )
+                                    if self._import_auto_enqueue_row(row, iid):
+                                        queued += 1
+                                else:
+                                    row['match_key'] = None
+                                    row['match_url'] = None
+                                    row['match_title'] = None
+                                    row['match_score'] = None
+                                    row['match_verify'] = None
+                                    row['match_hits'] = enriched
+                                    self.ui_log(
+                                        f'Import SHA declined: {name[:60]!r}'
+                                    )
                         else:
                             row['match_key'] = None
                             row['match_url'] = None

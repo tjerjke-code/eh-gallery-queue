@@ -30,6 +30,7 @@ RELOAD_DEPS = (
     'downloader',
     'pixiv',
     'duped_tab',
+    'import_sha_compare',
     'import_tab',
     'pixiv_tab',
     'app',

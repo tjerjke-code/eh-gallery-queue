@@ -65,6 +65,8 @@
 - Optional later: explicit source filter (manual / auto / all) if mixed list stays noisy.
 
 ## Done (recent)
+- Import: SHA fallback compare picker (covers, page thumbs, meta, Open EH;
+  pick any candidate or None) — `import_sha_compare.py`
 - Duped: set-sibling hints (mix synth/page holes → highlighted rows; prefer
   dedicated set home + rename on Move)
 - Duped: remove match board; compare session with SHA match groups (Done)

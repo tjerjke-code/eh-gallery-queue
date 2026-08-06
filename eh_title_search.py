@@ -38,6 +38,9 @@ VERIFY_MAX_CANDIDATES = 5
 VERIFY_PAGE_INTERVAL = 1.0
 # When title search fails: hash this many local files and intersect f_shash hits.
 SHA_SAMPLE_COUNT = 3
+# First-page EH thumbs shown in the Import SHA compare picker.
+COMPARE_THUMB_LIMIT = 4
+_CSS_URL = re.compile(r"""url\(\s*(['"]?)([^)'"]+)\1\s*\)""", re.IGNORECASE)
 
 
 def normalize_spaces(text: str) -> str:
@@ -221,20 +224,122 @@ def gallery_image_total(soup: BeautifulSoup) -> int:
 
 def gallery_thumb_names(soup: BeautifulSoup, *, limit: int = VERIFY_SAMPLE_NAMES) -> list[str]:
     """First-page thumb display names (EH ``title`` attr after ``Page N: ``)."""
+    return [t["name"] for t in gallery_page_thumbs(soup, limit=limit) if t.get("name")]
+
+
+def _css_background_url(style: str | None) -> str | None:
+    if not style:
+        return None
+    m = _CSS_URL.search(style)
+    return m.group(2).strip() if m else None
+
+
+def gallery_cover_url(soup: BeautifulSoup) -> str | None:
+    """Cover image URL from ``#gd1`` (CSS background or ``<img>``)."""
+    gd1 = soup.find("div", id="gd1")
+    if gd1:
+        for el in gd1.find_all(True):
+            url = _css_background_url(el.get("style"))
+            if url and not url.startswith("data:"):
+                return url
+        img = gd1.find("img", src=True)
+        if img and img.get("src"):
+            return img["src"].strip()
+    thumbs = gallery_page_thumbs(soup, limit=1)
+    return thumbs[0].get("url") if thumbs else None
+
+
+def gallery_page_thumbs(
+    soup: BeautifulSoup, *, limit: int = COMPARE_THUMB_LIMIT
+) -> list[dict]:
+    """First-page thumbs: ``[{name, url}, …]`` from ``#gdt`` / ``.gt200``."""
     box = soup.find("div", id="gdt") or soup.find("div", class_="gt200")
     if not box:
         return []
-    names: list[str] = []
+    out: list[dict] = []
     for a in box.find_all("a", href=True):
         title_el = a.find(attrs={"title": True})
-        if not title_el:
+        name = ""
+        if title_el and title_el.get("title"):
+            name = title_el["title"].split(": ")[-1].strip()
+        url = None
+        img = a.find("img", src=True)
+        if img and img.get("src"):
+            url = img["src"].strip()
+        if not url:
+            for el in a.find_all(True):
+                url = _css_background_url(el.get("style"))
+                if url:
+                    break
+            if not url:
+                url = _css_background_url(a.get("style"))
+        if not name and not url:
             continue
-        name = title_el["title"].split(": ")[-1].strip()
-        if name:
-            names.append(name)
-        if len(names) >= limit:
+        out.append({"name": name or None, "url": url})
+        if len(out) >= limit:
             break
-    return names
+    return out
+
+
+def gallery_gdd_fields(soup: BeautifulSoup) -> dict[str, str]:
+    """Key/value rows from the gallery ``#gdd`` metadata table."""
+    gdd = soup.find("div", id="gdd")
+    if not gdd:
+        return {}
+    fields: dict[str, str] = {}
+    for tr in gdd.find_all("tr"):
+        cells = [td.get_text(" ", strip=True) for td in tr.find_all("td")]
+        if len(cells) >= 2:
+            key = cells[0].rstrip(":").strip().casefold()
+            fields[key] = cells[1].strip()
+    return fields
+
+
+def gallery_category(soup: BeautifulSoup) -> str | None:
+    gdc = soup.find("div", id="gdc")
+    if not gdc:
+        return None
+    text = gdc.get_text(" ", strip=True)
+    return text or None
+
+
+def gallery_language_tags(soup: BeautifulSoup, *, limit: int = 6) -> list[str]:
+    """Language / translator style tags from ``#taglist`` (short list)."""
+    box = soup.find("div", id="taglist")
+    if not box:
+        return []
+    out: list[str] = []
+    for a in box.find_all("a", href=True):
+        href = a.get("href") or ""
+        text = a.get_text(" ", strip=True)
+        if not text:
+            continue
+        if "/language/" in href or text.casefold().startswith("language:"):
+            label = text.split(":", 1)[-1].strip() if ":" in text else text
+            if label and label not in out:
+                out.append(label)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def fetch_image_bytes(
+    session: requests.Session,
+    url: str,
+    *,
+    timeout: float = 20,
+) -> bytes | None:
+    """Download image bytes for a cover/thumb (best-effort)."""
+    if not url or url.startswith("data:"):
+        return None
+    try:
+        r = session.get(url, timeout=timeout)
+        r.raise_for_status()
+        data = r.content or b""
+        return data if data else None
+    except Exception as e:
+        log.debug("thumb fetch failed %s: %s", url[:80], e)
+        return None
 
 
 def verify_folder_against_meta(
@@ -287,27 +392,128 @@ def verify_hit_against_folder(
     timeout: float = 45,
 ) -> dict:
     """Fetch gallery page and confirm ``hit`` against ``folder``. Mutates a copy."""
+    return enrich_sha_candidate(
+        session,
+        folder,
+        hit,
+        sample_names=sample_names,
+        timeout=timeout,
+        fetch_images=False,
+    )
+
+
+def enrich_sha_candidate(
+    session: requests.Session,
+    folder: Path,
+    hit: dict,
+    *,
+    sample_names: int = VERIFY_SAMPLE_NAMES,
+    thumb_limit: int = COMPARE_THUMB_LIMIT,
+    timeout: float = 45,
+    fetch_images: bool = True,
+) -> dict:
+    """Fetch gallery page meta (+ optional cover/thumb bytes) for SHA compare UI."""
     folder = Path(folder)
     row = dict(hit)
     local_count, local_keys = local_folder_name_keys(folder)
+    row["local_count"] = local_count
     soup = fetch_gallery_soup(session, row["url"], timeout=timeout)
     total = gallery_image_total(soup)
-    thumbs = gallery_thumb_names(soup, limit=max(sample_names, 1))
-    # Prefer title from gallery page when search snippet was empty/short.
+    page_thumbs = gallery_page_thumbs(soup, limit=max(thumb_limit, sample_names, 1))
+    thumb_names = [t["name"] for t in page_thumbs if t.get("name")]
     gn = soup.find("h1", id="gn")
     if gn and gn.get_text(strip=True):
         row["title"] = gn.get_text(strip=True)
+    gj = soup.find("h1", id="gj")
+    if gj and gj.get_text(strip=True):
+        row["title_jpn"] = gj.get_text(strip=True)
+    gdd = gallery_gdd_fields(soup)
+    row["category"] = gallery_category(soup)
+    row["posted"] = gdd.get("posted")
+    row["file_size"] = gdd.get("file size") or gdd.get("filesize")
+    lang = gdd.get("language")
+    langs = gallery_language_tags(soup)
+    if lang and lang not in langs:
+        langs = [lang] + langs
+    row["languages"] = langs
+    cover_url = gallery_cover_url(soup)
+    row["cover_url"] = cover_url
+    row["page_thumbs"] = page_thumbs
     ok, reason = verify_folder_against_meta(
         local_count,
         local_keys,
         image_total=total,
-        thumb_names=thumbs,
+        thumb_names=thumb_names,
         sample_names=sample_names,
     )
     row["image_total"] = total
     row["verified"] = ok
-    row["verify"] = reason
+    # Keep SHA vote label when present; append page-check reason.
+    sha_verify = hit.get("verify")
+    if sha_verify and str(sha_verify).startswith("sha "):
+        row["verify"] = f"{sha_verify}; {reason}"
+    else:
+        row["verify"] = reason
+    if fetch_images:
+        cover_bytes = fetch_image_bytes(session, cover_url or "") if cover_url else None
+        row["cover_bytes"] = cover_bytes
+        thumb_bytes: list[bytes | None] = []
+        for t in page_thumbs[:thumb_limit]:
+            thumb_bytes.append(
+                fetch_image_bytes(session, t.get("url") or "") if t.get("url") else None
+            )
+        row["page_thumb_bytes"] = thumb_bytes
     return row
+
+
+def enrich_sha_candidates(
+    session: requests.Session,
+    folder: Path | str,
+    candidates: list[dict],
+    *,
+    interval: float = VERIFY_PAGE_INTERVAL,
+    should_stop: Callable[[], bool] | None = None,
+    fetch_images: bool = True,
+) -> list[dict]:
+    """Enrich each SHA candidate for the compare picker (polite page gaps)."""
+    stop = should_stop or (lambda: False)
+    folder = Path(folder)
+    if not candidates:
+        return []
+    out: list[dict] = []
+    for i, hit in enumerate(candidates):
+        if stop():
+            break
+        if i > 0 and interval > 0:
+            t_end = time.monotonic() + interval
+            while time.monotonic() < t_end:
+                if stop():
+                    return out
+                time.sleep(min(0.2, t_end - time.monotonic()))
+        try:
+            out.append(
+                enrich_sha_candidate(
+                    session,
+                    folder,
+                    hit,
+                    fetch_images=fetch_images,
+                )
+            )
+        except Exception as e:
+            log.warning(
+                "SHA enrich failed for %s: %s",
+                hit.get("gallery_key") or hit.get("url"),
+                e,
+            )
+            row = dict(hit)
+            try:
+                n, _ = local_folder_name_keys(folder)
+                row["local_count"] = n
+            except Exception:
+                pass
+            row["enrich_error"] = str(e)
+            out.append(row)
+    return out
 
 
 def confirm_hits(
