@@ -358,9 +358,15 @@ class EHDownloader:
                         self.log(f'  fp lookup failed: {e}')
                     if hit:
                         prior = hit.get('sample_path') or 'known file'
+                        via = hit.get('matched_via') or 'exact'
+                        hit_sha = hit.get('sha1') or digest
                         aliases = []
                         try:
-                            aliases = self.store.list_name_aliases(digest)
+                            aliases = self.store.list_name_aliases(hit_sha)
+                            if via == 'equivalent' and hit_sha != digest:
+                                aliases = aliases + (
+                                    self.store.list_name_aliases(digest) or []
+                                )
                         except Exception:
                             pass
                         alias_hint = ''
@@ -372,8 +378,13 @@ class EHDownloader:
                             })
                             if names:
                                 alias_hint = f'; known as {names[:3]}'
+                        match_lbl = (
+                            'exact match'
+                            if via == 'exact'
+                            else 'match-group equivalent'
+                        )
                         self.log(
-                            f'  skip {pic_name} — exact match in DB '
+                            f'  skip {pic_name} — {match_lbl} in DB '
                             f'({prior}){alias_hint}'
                         )
                         self._fp_register(
@@ -382,6 +393,11 @@ class EHDownloader:
                             path=hit.get('sample_path'),
                             ordered_name=pic_name,
                         )
+                        if via == 'equivalent' and hit_sha != digest:
+                            try:
+                                self.store.merge_sha1_match(digest, hit_sha)
+                            except Exception:
+                                pass
                         # Visibility: symlink into this gallery (DB is still
                         # source of truth; pair SHA never re-enqueues EH check).
                         real = resolve_real_file(hit.get('sample_path'))

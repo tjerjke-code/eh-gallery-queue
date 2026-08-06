@@ -14,23 +14,25 @@
   - `dbo.image_fingerprints` — exact content id (`sha1 BINARY(20)`)
   - `dbo.image_name_aliases` — ordered name + bare thumb name + gallery_key
     per sighting (soft; canonical `sample_path` stays first copy / Duped home)
+  - `dbo.sha1_match_groups` — user-confirmed multi-SHA identity (compare Done);
+    members behave like one content id for Duped Exact + download skip
   - **Duped** tab — manual appoint home + move; optional peer symlinks
   - Auto-symlink on SHA skip so empty/partial folders stay visible
 - When implementing automatic rules: read aliases + bare names, score against
   user rules, soft-rename or link into target set folders without losing
   alias history.
 - Related: `db.py` (`record_name_alias`, `list_name_aliases`, `register_sha1`,
-  `list_dupe_galleries`), `fs_links.py`, download skip path in `app.py`,
-  `tools/backfill_pics.py`
+  `list_dupe_galleries`, `merge_sha1_match`), `fs_links.py`, download skip path
+  in `downloader.py`, `tools/backfill_pics.py`
 
 ### Perceptual dHash for post-resize matching
 - Status: **partial** (Duped Near mode)
 - Column `image_fingerprints.dhash` filled by background worker + on register
 - Cached `dhash_near_pairs` (BK-tree rebuild / incremental upsert)
 - `dhash_false_positives` for dismissed pairs
-- Duped: Exact SHA / Near dHash toggle; scrollable ±3 match board + hover;
-  mark FP; manual neighbor Link (source=manual); large compare Toplevel;
-  UI module: `duped_tab.py`
+- Duped: Exact SHA / Near dHash toggle; **compare session** (double-click row):
+  Same / False positive / Prev–Next parallel walk / More picker / Done →
+  `sha1_match_groups`; UI module: `duped_tab.py`
 - No move/home for near matches yet (review-only)
 
 ### Queue filter (manual / auto / all)
@@ -40,6 +42,7 @@
 - Optional later: explicit source filter (manual / auto / all) if mixed list stays noisy.
 
 ## Done (recent)
+- Duped: remove match board; compare session with SHA match groups (Done)
 - Queue: reorder selected rows (↑ ↓ Top Bottom); persists `position`; rebuilds
   waiting jobs if Start is already running
 - Duped tab: shared SHA galleries, mark home, move ± peer symlinks; DB aliases
@@ -48,8 +51,7 @@
   `home_decided` so those SHAs reappear for review; Strip peers removes peer
   symlinks that point at the home file (nofollow path guard)
 - Auto-symlink into gallery folder when download skips on exact SHA match
-- Duped: Exact/Near toggle; scrollable match board (±3 strips, Link neighbors);
-  false positives; manual pairs survive Rebuild; large compare window (double-click);
+- Duped: Exact/Near toggle; false positives; large compare session (double-click);
   UI lives in `duped_tab.py` (`DupedTab`)
 - Local Import tab: scan pics folders, EH title search (quoted `f_search` +
   fallbacks), register into `galleries` + fingerprints, or enqueue to verify;

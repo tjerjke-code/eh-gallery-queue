@@ -10,6 +10,7 @@ from __future__ import annotations
 import configparser
 import re
 import threading
+import uuid
 from pathlib import Path
 
 import pyodbc
@@ -437,23 +438,62 @@ class QueueStore:
                 ALTER TABLE dbo.dhash_near_pairs ADD
                     source NVARCHAR(16) NOT NULL
                         CONSTRAINT DF_dhash_near_src DEFAULT (N'dhash');
+
+                -- User-confirmed SHA identity groups (Duped compare Done).
+                -- Members behave like one content id for shared/dupe listing + skip.
+                IF OBJECT_ID(N'dbo.sha1_match_groups', N'U') IS NULL
+                CREATE TABLE dbo.sha1_match_groups (
+                    group_id     UNIQUEIDENTIFIER NOT NULL,
+                    sha1         BINARY(20)       NOT NULL,
+                    created_at   DATETIME2        NOT NULL
+                        CONSTRAINT DF_sha1_match_created
+                        DEFAULT (SYSUTCDATETIME()),
+                    CONSTRAINT PK_sha1_match_groups PRIMARY KEY (sha1)
+                );
+
+                IF NOT EXISTS (
+                    SELECT 1 FROM sys.indexes
+                    WHERE name = N'IX_sha1_match_group'
+                      AND object_id = OBJECT_ID(N'dbo.sha1_match_groups')
+                )
+                CREATE INDEX IX_sha1_match_group
+                    ON dbo.sha1_match_groups (group_id);
                 """
             )
             self._conn().commit()
 
     def lookup_sha1(self, digest: bytes) -> dict | None:
-        """Return first-seen row for an exact file hash, or None."""
+        """Return fingerprint row for digest, or an equivalent match-group member."""
         if not digest or len(digest) != 20:
             return None
         with self._lock:
-            row = self._conn().cursor().execute(
+            cur = self._conn().cursor()
+            row = cur.execute(
                 """
-                SELECT sample_path, byte_len, gallery_key, seen_count, dhash
+                SELECT sample_path, byte_len, gallery_key, seen_count, dhash, sha1
                 FROM dbo.image_fingerprints
                 WHERE sha1 = ?
                 """,
                 digest,
             ).fetchone()
+            if not row:
+                # Prefer any equivalent that already has a sample path (home).
+                row = cur.execute(
+                    """
+                    SELECT TOP (1)
+                        f.sample_path, f.byte_len, f.gallery_key, f.seen_count,
+                        f.dhash, f.sha1
+                    FROM dbo.sha1_match_groups g0
+                    INNER JOIN dbo.sha1_match_groups g1
+                        ON g1.group_id = g0.group_id
+                    INNER JOIN dbo.image_fingerprints f ON f.sha1 = g1.sha1
+                    WHERE g0.sha1 = ?
+                      AND f.sample_path IS NOT NULL
+                      AND LTRIM(RTRIM(f.sample_path)) <> N''
+                    ORDER BY ISNULL(f.home_decided, 0) DESC, f.seen_count DESC
+                    """,
+                    digest,
+                ).fetchone()
         if not row:
             return None
         return {
@@ -462,7 +502,109 @@ class QueueStore:
             "gallery_key": row[2],
             "seen_count": int(row[3] or 0),
             "dhash": from_sql_bigint(int(row[4])) if row[4] is not None else None,
+            "sha1": bytes(row[5]) if row[5] is not None else digest,
+            "matched_via": "exact" if bytes(row[5]) == digest else "equivalent",
         }
+
+    def equivalent_shas(self, digest: bytes) -> set[bytes]:
+        """All SHAs in the same match group as ``digest`` (includes self)."""
+        if not digest or len(digest) != 20:
+            return set()
+        with self._lock:
+            rows = self._conn().cursor().execute(
+                """
+                SELECT g1.sha1
+                FROM dbo.sha1_match_groups g0
+                INNER JOIN dbo.sha1_match_groups g1
+                    ON g1.group_id = g0.group_id
+                WHERE g0.sha1 = ?
+                """,
+                digest,
+            ).fetchall()
+        if not rows:
+            return {digest}
+        return {bytes(r[0]) for r in rows} | {digest}
+
+    def merge_sha1_match(self, sha_a: bytes, sha_b: bytes) -> bool:
+        """Union two digests into one match group (alias-like identity)."""
+        if not sha_a or not sha_b or len(sha_a) != 20 or len(sha_b) != 20:
+            return False
+        if sha_a == sha_b:
+            return False
+
+        with self._lock:
+            cur = self._conn().cursor()
+            ga = cur.execute(
+                "SELECT group_id FROM dbo.sha1_match_groups WHERE sha1 = ?",
+                sha_a,
+            ).fetchone()
+            gb = cur.execute(
+                "SELECT group_id FROM dbo.sha1_match_groups WHERE sha1 = ?",
+                sha_b,
+            ).fetchone()
+            if ga and gb:
+                id_a, id_b = ga[0], gb[0]
+                if id_a == id_b:
+                    self._conn().commit()
+                    return False
+                cur.execute(
+                    """
+                    UPDATE dbo.sha1_match_groups
+                    SET group_id = ?
+                    WHERE group_id = ?
+                    """,
+                    id_a,
+                    id_b,
+                )
+            elif ga:
+                cur.execute(
+                    """
+                    INSERT INTO dbo.sha1_match_groups (group_id, sha1)
+                    VALUES (?, ?)
+                    """,
+                    ga[0],
+                    sha_b,
+                )
+            elif gb:
+                cur.execute(
+                    """
+                    INSERT INTO dbo.sha1_match_groups (group_id, sha1)
+                    VALUES (?, ?)
+                    """,
+                    gb[0],
+                    sha_a,
+                )
+            else:
+                gid = str(uuid.uuid4())
+                cur.execute(
+                    """
+                    INSERT INTO dbo.sha1_match_groups (group_id, sha1)
+                    VALUES (?, ?)
+                    """,
+                    gid,
+                    sha_a,
+                )
+                cur.execute(
+                    """
+                    INSERT INTO dbo.sha1_match_groups (group_id, sha1)
+                    VALUES (?, ?)
+                    """,
+                    gid,
+                    sha_b,
+                )
+            self._conn().commit()
+        return True
+
+    def merge_sha1_matches(self, pairs: list[tuple[bytes, bytes]]) -> int:
+        """Merge many Same pairs; returns number of successful merges."""
+        n = 0
+        for a, b in pairs:
+            try:
+                if self.merge_sha1_match(a, b):
+                    n += 1
+            except Exception:
+                raise
+        return n
 
     def list_name_aliases(self, digest: bytes) -> list[dict]:
         """All known names for this content (cross-gallery meta)."""
@@ -705,26 +847,61 @@ class QueueStore:
 
         With ``undecided_only``, only galleries that still have ≥1 shared SHA
         with ``home_decided = 0`` are returned (fully resolved homes drop out).
+
+        Also includes galleries linked only via ``sha1_match_groups`` (Done).
         """
         having_sql = ""
         if undecided_only:
             having_sql = (
                 "HAVING COUNT(DISTINCT CASE "
-                "WHEN ISNULL(f.home_decided, 0) = 0 THEN a.sha1 END) > 0"
+                "WHEN ISNULL(f.home_decided, 0) = 0 THEN sp.sha1 END) > 0"
             )
         with self._lock:
-            rows = self._conn().cursor().execute(
-                f"""
-                SELECT TOP (?)
-                    a.gallery_key,
-                    COUNT(DISTINCT a.sha1) AS shared_count,
-                    COUNT(DISTINCT peer.gallery_key) AS peer_count,
-                    MAX(COALESCE(g.title, q.title)) AS title,
-                    MAX(COALESCE(g.out_dir, q.out_dir)) AS out_dir,
-                    MAX(COALESCE(g.url, q.url)) AS url,
-                    COUNT(DISTINCT CASE
-                        WHEN ISNULL(f.home_decided, 0) = 0 THEN a.sha1 END
-                    ) AS undecided_count
+            cur = self._conn().cursor()
+            has_groups = bool(
+                cur.execute(
+                    "SELECT TOP (1) 1 FROM dbo.sha1_match_groups"
+                ).fetchone()
+            )
+            # Exact same-sha shares (indexed). Optional UNION for match groups —
+            # never OR them into one join (that nests the full aliases table).
+            if has_groups:
+                share_cte = """
+                WITH share_pairs AS (
+                    SELECT a.gallery_key, a.sha1, peer.gallery_key AS peer_gk
+                    FROM dbo.image_name_aliases a
+                    INNER JOIN dbo.image_name_aliases peer
+                        ON peer.sha1 = a.sha1
+                       AND peer.gallery_key <> a.gallery_key
+                       AND peer.gallery_key <> N''
+                    WHERE a.gallery_key <> N''
+                    UNION
+                    SELECT a.gallery_key, a.sha1, peer.gallery_key
+                    FROM dbo.image_name_aliases a
+                    INNER JOIN dbo.sha1_match_groups ga ON ga.sha1 = a.sha1
+                    INNER JOIN dbo.sha1_match_groups gb
+                        ON gb.group_id = ga.group_id
+                       AND gb.sha1 <> ga.sha1
+                    INNER JOIN dbo.image_name_aliases peer
+                        ON peer.sha1 = gb.sha1
+                       AND peer.gallery_key <> a.gallery_key
+                       AND peer.gallery_key <> N''
+                    WHERE a.gallery_key <> N''
+                )
+                """
+                from_sql = """
+                FROM share_pairs sp
+                INNER JOIN dbo.image_fingerprints f ON f.sha1 = sp.sha1
+                LEFT JOIN dbo.galleries g ON g.gallery_key = sp.gallery_key
+                LEFT JOIN dbo.queue_items q ON q.gallery_key = sp.gallery_key
+                """
+                select_key = "sp.gallery_key"
+                group_key = "sp.gallery_key"
+                peer_col = "sp.peer_gk"
+                sha_col = "sp.sha1"
+            else:
+                share_cte = ""
+                from_sql = """
                 FROM dbo.image_name_aliases a
                 INNER JOIN dbo.image_name_aliases peer
                     ON peer.sha1 = a.sha1
@@ -734,14 +911,38 @@ class QueueStore:
                 LEFT JOIN dbo.galleries g ON g.gallery_key = a.gallery_key
                 LEFT JOIN dbo.queue_items q ON q.gallery_key = a.gallery_key
                 WHERE a.gallery_key <> N''
-                GROUP BY a.gallery_key
+                """
+                select_key = "a.gallery_key"
+                group_key = "a.gallery_key"
+                peer_col = "peer.gallery_key"
+                sha_col = "a.sha1"
+                if undecided_only:
+                    having_sql = (
+                        "HAVING COUNT(DISTINCT CASE "
+                        "WHEN ISNULL(f.home_decided, 0) = 0 THEN a.sha1 END) > 0"
+                    )
+            rows = cur.execute(
+                f"""
+                {share_cte}
+                SELECT TOP (?)
+                    {select_key},
+                    COUNT(DISTINCT {sha_col}) AS shared_count,
+                    COUNT(DISTINCT {peer_col}) AS peer_count,
+                    MAX(COALESCE(g.title, q.title)) AS title,
+                    MAX(COALESCE(g.out_dir, q.out_dir)) AS out_dir,
+                    MAX(COALESCE(g.url, q.url)) AS url,
+                    COUNT(DISTINCT CASE
+                        WHEN ISNULL(f.home_decided, 0) = 0 THEN {sha_col} END
+                    ) AS undecided_count
+                {from_sql}
+                GROUP BY {group_key}
                 {having_sql}
                 ORDER BY
                     COUNT(DISTINCT CASE
-                        WHEN ISNULL(f.home_decided, 0) = 0 THEN a.sha1 END
+                        WHEN ISNULL(f.home_decided, 0) = 0 THEN {sha_col} END
                     ) DESC,
-                    COUNT(DISTINCT a.sha1) DESC,
-                    a.gallery_key ASC
+                    COUNT(DISTINCT {sha_col}) DESC,
+                    {select_key} ASC
                 """,
                 int(limit),
             ).fetchall()
@@ -763,7 +964,12 @@ class QueueStore:
     def list_shared_files_for_gallery(
         self, gallery_key: str, *, undecided_only: bool = False
     ) -> list[dict]:
-        """SHA-1s for ``gallery_key`` that also appear under other galleries."""
+        """SHA-1s for ``gallery_key`` that also appear under other galleries.
+
+        Includes peers linked only via ``sha1_match_groups`` (compare Done).
+        Aliases from equivalent digests are merged onto each row so Duped can
+        resolve peer names/paths.
+        """
         key = (gallery_key or "").strip()[:64]
         if not key:
             return []
@@ -772,6 +978,12 @@ class QueueStore:
             undecided_sql = "AND ISNULL(f.home_decided, 0) = 0"
         with self._lock:
             cur = self._conn().cursor()
+            has_groups = bool(
+                cur.execute(
+                    "SELECT TOP (1) 1 FROM dbo.sha1_match_groups"
+                ).fetchone()
+            )
+            # Fast path: same sha1 in another gallery.
             sha_rows = cur.execute(
                 f"""
                 SELECT DISTINCT a.sha1, f.sample_path, f.gallery_key, f.byte_len,
@@ -791,20 +1003,72 @@ class QueueStore:
                 """,
                 key,
             ).fetchall()
-            if not sha_rows:
+            by_digest: dict[bytes, tuple] = {
+                bytes(r[0]): r for r in sha_rows
+            }
+            if has_groups:
+                # Match-group peers only (indexed via sha1 PK on groups).
+                group_rows = cur.execute(
+                    f"""
+                    SELECT DISTINCT a.sha1, f.sample_path, f.gallery_key,
+                           f.byte_len, f.seen_count, ISNULL(f.home_decided, 0),
+                           gb.sha1
+                    FROM dbo.image_name_aliases a
+                    INNER JOIN dbo.image_fingerprints f ON f.sha1 = a.sha1
+                    INNER JOIN dbo.sha1_match_groups ga ON ga.sha1 = a.sha1
+                    INNER JOIN dbo.sha1_match_groups gb
+                        ON gb.group_id = ga.group_id
+                       AND gb.sha1 <> ga.sha1
+                    INNER JOIN dbo.image_name_aliases b
+                        ON b.sha1 = gb.sha1
+                       AND b.gallery_key <> a.gallery_key
+                       AND b.gallery_key <> N''
+                    WHERE a.gallery_key = ?
+                      {undecided_sql}
+                    """,
+                    key,
+                ).fetchall()
+            else:
+                group_rows = []
+            peer_for: dict[bytes, bytes] = {}
+            for r in group_rows:
+                digest = bytes(r[0])
+                peer_sha = bytes(r[6])
+                peer_for[digest] = peer_sha
+                if digest not in by_digest:
+                    by_digest[digest] = r[:6]
+            if not by_digest:
                 return []
-            digests = [bytes(r[0]) for r in sha_rows]
-            placeholders = ",".join("?" * len(digests))
+            digests = list(by_digest.keys())
+            all_shas = set(digests)
+            for p in peer_for.values():
+                all_shas.add(p)
+            # Also pull any other group members for alias merge.
+            if has_groups and digests:
+                placeholders = ",".join("?" * len(digests))
+                for r in cur.execute(
+                    f"""
+                    SELECT DISTINCT g1.sha1
+                    FROM dbo.sha1_match_groups g0
+                    INNER JOIN dbo.sha1_match_groups g1
+                        ON g1.group_id = g0.group_id
+                    WHERE g0.sha1 IN ({placeholders})
+                    """,
+                    *digests,
+                ).fetchall():
+                    all_shas.add(bytes(r[0]))
+            all_list = list(all_shas)
+            ph2 = ",".join("?" * len(all_list))
             alias_rows = cur.execute(
                 f"""
                 SELECT sha1, name, bare_name, gallery_key, sample_path
                 FROM dbo.image_name_aliases
-                WHERE sha1 IN ({placeholders})
+                WHERE sha1 IN ({ph2})
                 ORDER BY created_at ASC, id ASC
                 """,
-                *digests,
+                *all_list,
             ).fetchall()
-        by_sha: dict[bytes, list[dict]] = {d: [] for d in digests}
+        by_sha: dict[bytes, list[dict]] = {d: [] for d in all_list}
         for r in alias_rows:
             digest = bytes(r[0])
             by_sha.setdefault(digest, []).append(
@@ -813,11 +1077,45 @@ class QueueStore:
                     "bare_name": r[2],
                     "gallery_key": r[3] or "",
                     "sample_path": r[4],
+                    "sha1": digest,
                 }
             )
         out = []
-        for r in sha_rows:
-            digest = bytes(r[0])
+        for digest, r in by_digest.items():
+            peer_shas = {digest}
+            if digest in peer_for:
+                peer_shas.add(peer_for[digest])
+            # Include all group members we loaded for this digest.
+            for eq in all_shas:
+                if eq == digest or peer_for.get(digest) == eq:
+                    peer_shas.add(eq)
+            merged: list[dict] = []
+            seen_alias: set[tuple] = set()
+            for eq in peer_shas:
+                for a in by_sha.get(eq, []):
+                    sig = (a.get("gallery_key"), a.get("name"), eq)
+                    if sig in seen_alias:
+                        continue
+                    # Keep aliases for this digest + peer galleries only when
+                    # expanding via match group; same-sha aliases always keep.
+                    if eq == digest or eq == peer_for.get(digest):
+                        seen_alias.add(sig)
+                        merged.append(a)
+                    elif a.get("gallery_key") and a.get("gallery_key") != key:
+                        # Other group member names from peer galleries.
+                        seen_alias.add(sig)
+                        merged.append(a)
+            # For exact-only rows, still need peer aliases on same sha.
+            if digest not in peer_for:
+                merged = []
+                seen_alias = set()
+                for a in by_sha.get(digest, []):
+                    sig = (a.get("gallery_key"), a.get("name"), digest)
+                    if sig in seen_alias:
+                        continue
+                    seen_alias.add(sig)
+                    merged.append(a)
+            peer_sha = peer_for.get(digest)
             out.append(
                 {
                     "sha1": digest,
@@ -827,9 +1125,11 @@ class QueueStore:
                     "byte_len": int(r[3]) if r[3] is not None else None,
                     "seen_count": int(r[4] or 0),
                     "home_decided": bool(r[5]),
-                    "aliases": by_sha.get(digest, []),
+                    "peer_sha1": peer_sha if peer_sha and peer_sha != digest else None,
+                    "aliases": merged,
                 }
             )
+        out.sort(key=lambda x: x["sha1_hex"])
         return out
 
     # --- dHash near-dupes -------------------------------------------------

@@ -115,6 +115,34 @@ def remove_path_if_link_or_dup(path: Path, *, real_keep: Path) -> bool:
     return strip_peer_presence(path, real_keep=real_keep) in ("link", "dup")
 
 
+def remove_peer_any(path: Path, *, real_keep: Path) -> str:
+    """Remove peer symlink or real file (any size). Never deletes ``real_keep``.
+
+    Used after user-confirmed match-group Same (bytes may differ).
+    Returns ``link``, ``file``, ``home``, ``missing``, or ``skip``.
+    """
+    path = Path(path)
+    real_keep = Path(real_keep)
+    if same_entry(path, real_keep):
+        return "home"
+    try:
+        is_link = path.is_symlink()
+    except OSError:
+        is_link = False
+    if not is_link and not path.exists():
+        return "missing"
+    try:
+        if is_link:
+            path.unlink()
+            return "link"
+        if path.is_file():
+            path.unlink()
+            return "file"
+    except OSError:
+        return "skip"
+    return "skip"
+
+
 def strip_peer_presence(path: Path, *, real_keep: Path) -> str:
     """Remove a peer symlink or same-size duplicate; never delete ``real_keep``.
 

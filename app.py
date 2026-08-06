@@ -948,9 +948,18 @@ class App(ttk.Frame):
             try:
                 self.store.set_setting('out_dir', out)
                 self.store.set_setting('workers', str(workers))
-                self.store.resequence(self._queue_urls)
             except Exception as e:
-                self.ui_log(f'DB settings/sync failed: {e}')
+                self.ui_log(f'DB settings failed: {e}')
+            # Resequence can wait on SQL locks — never block the UI thread.
+            urls = list(self._queue_urls)
+
+            def _reseq():
+                try:
+                    self.store.resequence(urls)
+                except Exception as e:
+                    self._ui_schedule(lambda: self.ui_log(f'DB resequence failed: {e}'))
+
+            threading.Thread(target=_reseq, daemon=True, name='queue-reseq').start()
 
         self._stop.clear()
         while not self.job_queue.empty():

@@ -20,6 +20,7 @@ from fs_links import (
     ensure_symlink,
     move_real_file,
     remove_path_if_link_or_dup,
+    remove_peer_any,
     resolve_real_file,
     same_entry,
     same_path,
@@ -37,19 +38,18 @@ DUPED_COLOR_FOCUS = "#ECC94B"
 DUPED_NEIGHBOR_RADIUS = 3
 DUPED_THUMB_SIZE = 86
 DUPED_COMPARE_SIZE = 220
-DUPED_BOARD_THUMB_W = 56
-DUPED_BOARD_THUMB_H = 80
-DUPED_BOARD_BATCH = 2
 DUPED_COMPARE_WIN_W = 520
 DUPED_COMPARE_WIN_H = 700
 DUPED_MANUAL_HAMMING = 255
 DUPED_THUMB_APPLY_PER_TICK = 12
 DUPED_THUMB_READY_MAX = 240
 DUPED_TREE_CHUNK = 60
+DUPED_MORE_THUMB = 140
+DUPED_MORE_BATCH = 24
 
 
 class DupedTab(ttk.Frame):
-    """Exact/Near dupe review: gallery list, match board, large compare window."""
+    """Exact/Near dupe review: gallery list + compare session window."""
 
     def __init__(self, parent, host):
         super().__init__(parent)
@@ -57,6 +57,7 @@ class DupedTab(ttk.Frame):
 
         self._duped_rows: dict[str, dict] = {}
         self._duped_files: dict[str, dict] = {}
+        self._duped_file_list: list[dict] = []
         self._duped_stop = threading.Event()
         self._duped_busy = False
         self._duped_preview: tk.Toplevel | None = None
@@ -72,12 +73,6 @@ class DupedTab(ttk.Frame):
         self._duped_mode = "exact"
         self._dhash_worker: DhashFillWorker | None = None
         self._duped_compare_photos: list = []
-        self._duped_board_items: list[dict] = []
-        self._duped_board_loaded = 0
-        self._duped_linked_pairs: set[tuple[bytes, bytes]] = set()
-        self._duped_board_canvas: tk.Canvas | None = None
-        self._duped_board_window = None
-        self._duped_board_loading = False
         self._duped_thumb_cache: dict[str, object] = {}
         self._duped_thumb_gen = 0
         self._duped_thumb_queue: queue.Queue = queue.Queue()
@@ -86,10 +81,12 @@ class DupedTab(ttk.Frame):
         self._duped_thumb_ready_lock = threading.Lock()
         self._duped_file_pop_gen = 0
         self._duped_compare_win: tk.Toplevel | None = None
-        self._duped_compare_idx = 0
         self._duped_compare_win_photos: list = []
         self._duped_cw_widgets: dict = {}
-        self._duped_compare_reopen_after_refresh: int | None = None
+        self._duped_more_win: tk.Toplevel | None = None
+        self._duped_more_photos: list = []
+        # Compare session: parallel walk + staged Same/FP until Done.
+        self._session: dict | None = None
 
         self._build()
         self.start_dhash_worker()
@@ -123,6 +120,7 @@ class DupedTab(ttk.Frame):
         self._duped_file_pop_gen += 1
         self._duped_stop.set()
         self._duped_hide_preview()
+        self._duped_close_more_win()
         self._duped_close_compare_win()
         with self._duped_thumb_ready_lock:
             self._duped_thumb_ready.clear()
@@ -145,8 +143,9 @@ class DupedTab(ttk.Frame):
         ttk.Label(
             help_row,
             text=(
-                'Exact = SHA-1. Near = dHash. Match board = index (\u00b13). '
-                'Double-click row/card \u2192 large compare. Right-click \u2192 Explorer.'
+                'Exact = SHA-1 (+ match groups). Near = dHash. '
+                'Double-click row \u2192 compare session (Same / FP / Prev / Next / More / Done). '
+                'Right-click \u2192 Explorer.'
             ),
         ).pack(side='left')
 
@@ -232,12 +231,8 @@ class DupedTab(ttk.Frame):
             command=self.duped_mark_false_positive,
         ).pack(side='left', padx=(12, 2))
 
-        body = ttk.Panedwindow(self, orient='vertical')
-        body.pack(fill='both', expand=True, padx=8, pady=8)
-        self._duped_body_paned = body
-
-        lists = ttk.Panedwindow(body, orient='horizontal')
-        body.add(lists, weight=3)
+        lists = ttk.Panedwindow(self, orient='horizontal')
+        lists.pack(fill='both', expand=True, padx=8, pady=8)
 
         left = ttk.Frame(lists)
         right = ttk.Frame(lists)
@@ -294,7 +289,7 @@ class DupedTab(ttk.Frame):
         ).pack(side='left')
         ttk.Label(
             legend,
-            text='  (hover \u00b13 \u00b7 double-click \u2192 large compare)',
+            text='  (hover preview \u00b7 double-click \u2192 compare session)',
             foreground='#666666',
         ).pack(side='left', padx=8)
 
@@ -336,52 +331,9 @@ class DupedTab(ttk.Frame):
         )
         self.duped_file_tree.bind('<MouseWheel>', lambda _e: self._duped_hide_preview())
         self.duped_file_tree.bind('<Button-3>', self._on_duped_file_context)
-        self.duped_file_tree.bind('<<TreeviewSelect>>', self._on_duped_file_select)
         self.duped_file_tree.bind('<Double-1>', self._on_duped_file_double)
         self._duped_file_menu = tk.Menu(self, tearoff=0)
         self.duped_gallery_tree.bind('<ButtonRelease-1>', self._on_duped_gallery_click)
-
-        compare = ttk.LabelFrame(
-            body,
-            text='Match board (index · double-click / Compare \u2192 large window)',
-            padding=4,
-        )
-        body.add(compare, weight=3)
-        self._duped_compare_frame = compare
-
-        board_wrap = ttk.Frame(compare)
-        board_wrap.pack(fill='both', expand=True)
-        canvas = tk.Canvas(board_wrap, highlightthickness=0, bg='#1e1e1e')
-        vscroll = ttk.Scrollbar(board_wrap, orient='vertical', command=canvas.yview)
-        canvas.configure(yscrollcommand=vscroll.set)
-        vscroll.pack(side='right', fill='y')
-        canvas.pack(side='left', fill='both', expand=True)
-        inner = ttk.Frame(canvas)
-        self._duped_board_window = canvas.create_window((0, 0), window=inner, anchor='nw')
-        self._duped_board_canvas = canvas
-        self._duped_compare_inner = inner
-
-        def _on_inner_configure(_event=None):
-            canvas.configure(scrollregion=canvas.bbox('all'))
-
-        def _on_canvas_configure(event):
-            canvas.itemconfigure(self._duped_board_window, width=event.width)
-
-        def _on_board_scroll(event):
-            if event.delta:
-                canvas.yview_scroll(int(-event.delta / 120), 'units')
-            self._duped_board_maybe_load_more()
-
-        inner.bind('<Configure>', _on_inner_configure)
-        canvas.bind('<Configure>', _on_canvas_configure)
-        canvas.bind('<MouseWheel>', _on_board_scroll)
-        inner.bind('<MouseWheel>', _on_board_scroll)
-
-        ttk.Label(
-            inner,
-            text='Select a gallery — match cards appear here (no click-per-row needed).',
-            foreground='#888888',
-        ).pack(anchor='w', padx=4, pady=8)
 
         self.duped_status = tk.StringVar(
             value='Refresh to list galleries with shared fingerprints.'
@@ -408,6 +360,8 @@ class DupedTab(ttk.Frame):
             self._duped_compare_photos.append(photo)
             if self._duped_compare_win is not None:
                 self._duped_compare_win_photos.append(photo)
+            if self._duped_more_win is not None:
+                self._duped_more_photos.append(photo)
             try:
                 if lbl.winfo_exists():
                     lbl.configure(image=photo, text='')
@@ -938,7 +892,7 @@ class DupedTab(ttk.Frame):
         box: tuple[int, int] | None = None,
         fast: bool = False,
     ):
-        """Return PhotoImage or None (sync — prefer ``_duped_queue_thumb`` for board)."""
+        """Return PhotoImage or None (sync — prefer ``_duped_queue_thumb``)."""
         img = self._duped_decode_thumb_image(path, size=size, box=box, fast=fast)
         if img is None:
             return None
@@ -1475,36 +1429,18 @@ class DupedTab(ttk.Frame):
         self.duped_refresh()
 
 
-    def _on_duped_file_select(self, _event=None):
-        """Sync board scroll to the selected tree row (board already shows all)."""
-        if not self._lifecycle_alive:
-            return
-        sel = list(self.duped_file_tree.selection())
-        if not sel:
-            return
-        iid = sel[0]
-        # Cards are tagged with iid as widget name prefix card_<iid>
-        inner = getattr(self, '_duped_compare_inner', None)
-        canvas = getattr(self, '_duped_board_canvas', None)
-        if inner is None or canvas is None:
-            return
-        for child in inner.winfo_children():
-            if str(child).endswith(iid) or getattr(child, '_duped_iid', None) == iid:
-                try:
-                    canvas.yview_moveto(
-                        max(0.0, child.winfo_y() / max(1, inner.winfo_height()))
-                    )
-                except Exception:
-                    pass
-                break
+    @staticmethod
+    def _session_pair_key(a: bytes | None, b: bytes | None) -> tuple[bytes, bytes] | None:
+        if not a or not b:
+            return None
+        from image_dhash import order_sha_pair
 
+        return order_sha_pair(a, b)
 
     def _duped_clear_compare(self):
-        # Always tear down compare win; FP/Link set reopen flag to bring it back.
+        self._duped_close_more_win()
         self._duped_close_compare_win()
-        inner = getattr(self, '_duped_compare_inner', None)
-        if inner is None:
-            return
+        self._session = None
         self._duped_thumb_gen += 1
         try:
             while True:
@@ -1513,140 +1449,9 @@ class DupedTab(ttk.Frame):
             pass
         with self._duped_thumb_ready_lock:
             self._duped_thumb_ready.clear()
-        for child in inner.winfo_children():
-            child.destroy()
         self._duped_compare_photos = []
-        self._duped_board_items = []
-        self._duped_board_loaded = 0
-        self._duped_board_loading = False
         if len(self._duped_thumb_cache) > 4000:
             self._duped_thumb_cache.clear()
-
-
-    def _duped_pair_linked(self, a: bytes | None, b: bytes | None) -> bool:
-        if not a or not b:
-            return False
-        if a == b:
-            return True
-        from image_dhash import order_sha_pair
-
-        key = order_sha_pair(a, b)
-        return key in self._duped_linked_pairs
-
-
-    def _duped_rebuild_board(self, files: list[dict]):
-        """Fill the scrollable match board (lazy + async thumbs)."""
-        self._duped_clear_compare()
-        inner = self._duped_compare_inner
-        focus_key = self._duped_focus_key
-        if not focus_key:
-            ttk.Label(inner, text='Select a gallery.', foreground='#888').pack(
-                anchor='w', padx=4, pady=8
-            )
-            return
-        if not files:
-            ttk.Label(
-                inner, text='No matches listed for this gallery.', foreground='#888'
-            ).pack(anchor='w', padx=4, pady=8)
-            return
-        try:
-            self._duped_linked_pairs = (
-                self.store.load_linked_sha_pairs() if self.store else set()
-            )
-        except Exception:
-            self._duped_linked_pairs = set()
-        try:
-            self._duped_sequence(focus_key)
-        except Exception:
-            pass
-        peer_warm: set[str] = set()
-        for it in files[:40]:
-            pk = self._duped_peer_key(it, focus_key)
-            if pk and pk not in peer_warm:
-                peer_warm.add(pk)
-                try:
-                    self._duped_sequence(pk)
-                except Exception:
-                    pass
-                if len(peer_warm) >= 6:
-                    break
-        self._duped_board_items = list(files)
-        self._duped_board_loaded = 0
-        ttk.Label(
-            inner,
-            text=f'Loading match board… 0/{len(files)} (thumbs async)',
-            foreground='#888888',
-        ).pack(anchor='w', padx=4, pady=4)
-        self._ui_schedule(self._duped_board_fill_viewport)
-        self._ui_schedule(self._duped_maybe_reopen_compare)
-        self.after(1, self._duped_board_load_more)
-
-
-    def _duped_board_maybe_load_more(self):
-        canvas = self._duped_board_canvas
-        if canvas is None or self._duped_board_loading:
-            return
-        try:
-            _top, bottom = canvas.yview()
-        except Exception:
-            return
-        if bottom >= 0.85:
-            self._duped_board_load_more()
-
-
-    def _duped_board_fill_viewport(self):
-        if not self._lifecycle_alive or self._duped_board_loading:
-            return
-        if self._duped_board_loaded >= len(self._duped_board_items):
-            return
-        canvas = self._duped_board_canvas
-        if canvas is None:
-            return
-        try:
-            bbox = canvas.bbox('all')
-            if bbox is None:
-                self._duped_board_load_more()
-                return
-            if bbox[3] < max(120, canvas.winfo_height() - 8):
-                self._duped_board_load_more()
-        except Exception:
-            pass
-
-
-    def _duped_board_load_more(self):
-        if not self._lifecycle_alive or self._duped_board_loading:
-            return
-        items = self._duped_board_items
-        start = self._duped_board_loaded
-        if start >= len(items):
-            return
-        self._duped_board_loading = True
-        end = min(len(items), start + DUPED_BOARD_BATCH)
-        inner = self._duped_compare_inner
-        for child in list(inner.winfo_children()):
-            if isinstance(child, ttk.Label):
-                txt = str(child.cget('text') or '')
-                if txt.startswith('Loading match board'):
-                    child.destroy()
-        try:
-            for i in range(start, end):
-                self._duped_append_match_card(inner, items[i], index=i)
-            self._duped_board_loaded = end
-        finally:
-            self._duped_board_loading = False
-        canvas = self._duped_board_canvas
-        if canvas is not None:
-            try:
-                canvas.configure(scrollregion=canvas.bbox('all'))
-            except Exception:
-                pass
-        if end < len(items):
-            self.after(20, self._duped_board_fill_viewport)
-        else:
-            self.duped_status.set(
-                f'{self._duped_focus_key}: board complete ({end} cards)'
-            )
-
 
     def _duped_close_compare_win(self) -> None:
         win = self._duped_compare_win
@@ -1659,73 +1464,96 @@ class DupedTab(ttk.Frame):
             except Exception:
                 pass
 
-
-    def _duped_maybe_reopen_compare(self) -> None:
-        idx = self._duped_compare_reopen_after_refresh
-        self._duped_compare_reopen_after_refresh = None
-        if idx is None or not self._lifecycle_alive:
-            return
-        items = self._duped_board_items
-        if not items:
-            return
-        self._duped_open_compare(min(max(0, idx), len(items) - 1))
-
+    def _duped_close_more_win(self) -> None:
+        win = self._duped_more_win
+        self._duped_more_win = None
+        self._duped_more_photos = []
+        if win is not None:
+            try:
+                win.destroy()
+            except Exception:
+                pass
 
     def _on_duped_file_double(self, _event=None):
         sel = list(self.duped_file_tree.selection())
         if not sel:
             return
         iid = sel[0]
-        for i, it in enumerate(self._duped_board_items or self._duped_files):
-            if (it.get('sha1_hex') or '') == iid:
-                self._duped_open_compare(i)
-                return
-        # Fallback: files list before board finished
-        for i, it in enumerate(self._duped_files):
-            if (it.get('sha1_hex') or '') == iid:
-                if not self._duped_board_items:
-                    self._duped_board_items = list(self._duped_files)
-                self._duped_open_compare(i)
-                return
+        item = self._duped_files.get(iid)
+        if item:
+            self._duped_open_session(item)
 
+    def _duped_show_compare(self, item: dict):
+        """Open compare session for this match item."""
+        self._duped_open_session(item)
 
-    def _duped_open_compare(self, index: int) -> None:
-        items = self._duped_board_items
-        if not items:
+    def _duped_open_session(self, item: dict) -> None:
+        focus_key = self._duped_focus_key or ''
+        if not focus_key:
             return
-        index = max(0, min(int(index), len(items) - 1))
-        self._duped_compare_idx = index
-        win = self._duped_compare_win
-        if win is None or not win.winfo_exists():
-            self._duped_build_compare_win()
-            win = self._duped_compare_win
-        if win is None:
+        peer_key = self._duped_peer_key(item, focus_key)
+        if not peer_key:
+            messagebox.showinfo('Duped', 'No peer gallery for this row.')
             return
-        try:
-            win.deiconify()
-            win.lift()
-            win.focus_force()
-        except Exception:
-            pass
-        self._duped_compare_show(index)
-
+        left_seq = self._duped_sequence(focus_key)
+        right_seq = self._duped_sequence(peer_key)
+        left_idx = self._duped_index_in_seq(left_seq, item, focus_key)
+        right_idx = self._duped_index_in_seq(right_seq, item, peer_key)
+        # Match-group peer may use a different SHA than the local row.
+        peer_sha = item.get('peer_sha1')
+        if right_idx is None and peer_sha and right_seq:
+            for i, slot in enumerate(right_seq):
+                if slot.get('sha1') == peer_sha:
+                    right_idx = i
+                    break
+        if left_idx is None:
+            messagebox.showinfo(
+                'Duped',
+                'Could not locate this file in the gallery sequence.',
+            )
+            return
+        if right_idx is None:
+            right_idx = min(left_idx, max(0, len(right_seq) - 1)) if right_seq else 0
+        self._session = {
+            'focus_key': focus_key,
+            'peer_key': peer_key,
+            'left_idx': int(left_idx),
+            'right_idx': int(right_idx),
+            'anchor_left': int(left_idx),
+            'anchor_right': int(right_idx),
+            'nav_dir': 1,
+            'seed_item': item,
+            'staged_same': set(),
+            'staged_fp': set(),
+            'more_pick_left': None,
+            'more_pick_right': None,
+        }
+        self._duped_build_compare_win()
+        self._duped_session_show()
 
     def _duped_build_compare_win(self) -> None:
+        self._duped_close_more_win()
         self._duped_close_compare_win()
         win = tk.Toplevel(self)
-        win.title('Duped compare')
+        win.title('Duped compare session')
         win.configure(background='#1e1e1e')
         try:
             win.geometry('1100x820')
             win.minsize(720, 520)
         except Exception:
             pass
-        win.protocol('WM_DELETE_WINDOW', self._duped_close_compare_win)
-        win.bind('<Escape>', lambda _e: self._duped_close_compare_win())
-        win.bind('<Left>', lambda _e: self._duped_compare_nav(-1))
-        win.bind('<Right>', lambda _e: self._duped_compare_nav(1))
-        win.bind('<Prior>', lambda _e: self._duped_compare_nav(-1))
-        win.bind('<Next>', lambda _e: self._duped_compare_nav(1))
+        win.protocol('WM_DELETE_WINDOW', self._duped_session_cancel)
+        win.bind('<Escape>', lambda _e: self._duped_session_cancel())
+        win.bind('<Left>', lambda _e: self._duped_session_nav(-1))
+        win.bind('<Right>', lambda _e: self._duped_session_nav(1))
+        win.bind('<Prior>', lambda _e: self._duped_session_nav(-1))
+        win.bind('<Next>', lambda _e: self._duped_session_nav(1))
+        win.bind('<Home>', lambda _e: self._duped_session_jump_end(-1))
+        win.bind('<End>', lambda _e: self._duped_session_jump_end(1))
+        win.bind('s', lambda _e: self._duped_session_mark_same())
+        win.bind('S', lambda _e: self._duped_session_mark_same())
+        win.bind('f', lambda _e: self._duped_session_mark_fp())
+        win.bind('F', lambda _e: self._duped_session_mark_fp())
 
         root = tk.Frame(win, bg='#1e1e1e', padx=8, pady=8)
         root.pack(fill='both', expand=True)
@@ -1738,21 +1566,43 @@ class DupedTab(ttk.Frame):
             root, text='', fg='#aaa', bg='#1e1e1e', font=('Segoe UI', 9), justify='left'
         )
         meta.pack(anchor='w', pady=(2, 6))
+        status = tk.Label(
+            root, text='', fg='#8f8', bg='#1e1e1e', font=('Segoe UI', 9, 'bold')
+        )
+        status.pack(anchor='w', pady=(0, 4))
 
         nav = tk.Frame(root, bg='#1e1e1e')
         nav.pack(fill='x', pady=(0, 6))
-        ttk.Button(nav, text='← Prev', width=10, command=lambda: self._duped_compare_nav(-1)).pack(
-            side='left', padx=2
-        )
-        ttk.Button(nav, text='Next →', width=10, command=lambda: self._duped_compare_nav(1)).pack(
-            side='left', padx=2
-        )
         ttk.Button(
-            nav, text='False positive', width=14, command=self._duped_compare_fp
+            nav, text='<<', width=4, command=lambda: self._duped_session_jump_end(-1)
+        ).pack(side='left', padx=2)
+        ttk.Button(
+            nav, text='← Prev', width=10, command=lambda: self._duped_session_nav(-1)
+        ).pack(side='left', padx=2)
+        ttk.Button(
+            nav, text='Next →', width=10, command=lambda: self._duped_session_nav(1)
+        ).pack(side='left', padx=2)
+        ttk.Button(
+            nav, text='>>', width=4, command=lambda: self._duped_session_jump_end(1)
+        ).pack(side='left', padx=2)
+        ttk.Button(
+            nav, text='Same', width=10, command=self._duped_session_mark_same
         ).pack(side='left', padx=(16, 2))
+        ttk.Button(
+            nav, text='False positive', width=14, command=self._duped_session_mark_fp
+        ).pack(side='left', padx=2)
+        ttk.Button(
+            nav, text='More…', width=10, command=self._duped_session_open_more
+        ).pack(side='left', padx=(16, 2))
+        ttk.Button(
+            nav, text='Done', width=10, command=self._duped_session_done
+        ).pack(side='left', padx=(16, 2))
+        ttk.Button(
+            nav, text='Cancel', width=10, command=self._duped_session_cancel
+        ).pack(side='left', padx=2)
         tk.Label(
             nav,
-            text='←/→ navigate · Esc close',
+            text='<< / >> ends · ←/→ walk · S same (skip matched) · F FP · Esc',
             fg='#666',
             bg='#1e1e1e',
             font=('Segoe UI', 8),
@@ -1801,395 +1651,592 @@ class DupedTab(ttk.Frame):
         right_img = tk.Label(right_col, text='…', fg='#888', bg='#111')
         right_img.pack(fill='both', expand=True, padx=6, pady=6)
 
-        link_row = tk.Frame(root, bg='#1e1e1e')
-        link_row.pack(fill='x', pady=(8, 0))
-        tk.Label(
-            link_row,
-            text='Link neighbors:',
-            fg='#888',
-            bg='#1e1e1e',
-            font=('Segoe UI', 8),
-        ).pack(side='left')
-
         self._duped_compare_win = win
         self._duped_cw_widgets = {
             'title': title,
             'meta': meta,
+            'status': status,
             'left_name': left_name,
             'right_name': right_name,
             'left_img': left_img,
             'right_img': right_img,
-            'link_row': link_row,
         }
         self._duped_compare_win_photos = []
 
+    def _duped_session_current_shas(self) -> tuple[bytes | None, bytes | None]:
+        sess = self._session
+        if not sess:
+            return None, None
+        return self._duped_session_shas_at(sess['left_idx'], sess['right_idx'])
 
-    def _duped_compare_nav(self, delta: int) -> None:
-        items = self._duped_board_items
-        if not items:
+    def _duped_session_shas_at(
+        self, left_idx: int, right_idx: int
+    ) -> tuple[bytes | None, bytes | None]:
+        sess = self._session
+        if not sess:
+            return None, None
+        left_seq = self._duped_sequence(sess['focus_key'])
+        right_seq = self._duped_sequence(sess['peer_key'])
+        sha_l = left_seq[left_idx].get('sha1') if 0 <= left_idx < len(left_seq) else None
+        sha_r = (
+            right_seq[right_idx].get('sha1') if 0 <= right_idx < len(right_seq) else None
+        )
+        return sha_l, sha_r
+
+    def _duped_session_slice_left_range(self) -> tuple[int, int] | None:
+        """Inclusive left-index range ``[lo, hi]`` where both sides stay in bounds."""
+        sess = self._session
+        if not sess:
+            return None
+        left_seq = self._duped_sequence(sess['focus_key'])
+        right_seq = self._duped_sequence(sess['peer_key'])
+        if not left_seq or not right_seq:
+            return None
+        offset = int(sess['anchor_left']) - int(sess['anchor_right'])
+        # R = L - offset; need 0 <= L < lenL and 0 <= R < lenR
+        lo = max(0, offset)
+        hi_excl = min(len(left_seq), len(right_seq) + offset)
+        if lo >= hi_excl:
+            return None
+        return lo, hi_excl - 1
+
+    def _duped_session_nav(self, delta: int) -> bool:
+        """Move both sides by ``delta``. Returns False if blocked at an edge."""
+        sess = self._session
+        if not sess:
+            return False
+        d = int(delta)
+        if d:
+            sess['nav_dir'] = 1 if d > 0 else -1
+        left_seq = self._duped_sequence(sess['focus_key'])
+        right_seq = self._duped_sequence(sess['peer_key'])
+        if not left_seq and not right_seq:
+            return False
+        new_l = sess['left_idx'] + d
+        new_r = sess['right_idx'] + d
+        if left_seq and not (0 <= new_l < len(left_seq)):
+            return False
+        if right_seq and not (0 <= new_r < len(right_seq)):
+            return False
+        if left_seq:
+            sess['left_idx'] = new_l
+        if right_seq:
+            sess['right_idx'] = new_r
+        sess['more_pick_left'] = None
+        sess['more_pick_right'] = None
+        self._duped_session_show()
+        return True
+
+    def _duped_session_jump_end(self, which: int) -> None:
+        """Jump to start (``which < 0``) or end (``which > 0``) of the aligned slice."""
+        sess = self._session
+        if not sess:
             return
-        self._duped_open_compare(self._duped_compare_idx + int(delta))
-
-
-    def _duped_compare_fp(self) -> None:
-        items = self._duped_board_items
-        if not items:
+        bounds = self._duped_session_slice_left_range()
+        if bounds is None:
             return
-        idx = self._duped_compare_idx
-        if 0 <= idx < len(items):
-            self._duped_fp_one(items[idx])
+        lo, hi = bounds
+        offset = int(sess['anchor_left']) - int(sess['anchor_right'])
+        target_l = lo if which < 0 else hi
+        sess['left_idx'] = target_l
+        sess['right_idx'] = target_l - offset
+        sess['nav_dir'] = -1 if which < 0 else 1
+        sess['more_pick_left'] = None
+        sess['more_pick_right'] = None
+        self._duped_session_show()
 
+    def _duped_session_goto_unmatched(self, direction: int | None = None) -> bool:
+        """Advance to the next pair not in staged Same, following walk direction."""
+        sess = self._session
+        if not sess:
+            return False
+        direction = int(direction if direction is not None else sess.get('nav_dir') or 1)
+        if direction == 0:
+            direction = 1
+        sess['nav_dir'] = direction
+        bounds = self._duped_session_slice_left_range()
+        if bounds is None:
+            return False
+        lo, hi = bounds
+        offset = int(sess['anchor_left']) - int(sess['anchor_right'])
+        cur_l = int(sess['left_idx'])
+        step = 1 if direction > 0 else -1
+        # Start searching from the neighbor of the current (just-matched) slot.
+        pos = cur_l + step
+        while lo <= pos <= hi:
+            ri = pos - offset
+            sha_l, sha_r = self._duped_session_shas_at(pos, ri)
+            key = self._session_pair_key(sha_l, sha_r)
+            if key is None and sha_l and sha_r and sha_l == sha_r:
+                key = (sha_l, sha_r)
+            if key is None or key not in sess['staged_same']:
+                sess['left_idx'] = pos
+                sess['right_idx'] = ri
+                sess['more_pick_left'] = None
+                sess['more_pick_right'] = None
+                self._duped_session_show()
+                return True
+            pos += step
+        return False
 
-    def _duped_compare_show(self, index: int) -> None:
-        items = self._duped_board_items
+    def _duped_session_mark_same(self) -> None:
+        sess = self._session
+        if not sess:
+            return
+        sha_l, sha_r = self._duped_session_current_shas()
+        key = self._session_pair_key(sha_l, sha_r)
+        if key is None:
+            # Same SHA or missing: still stage identical digests as reviewed.
+            if sha_l and sha_r and sha_l == sha_r:
+                key = (sha_l, sha_r)
+            elif sha_l and not sha_r:
+                messagebox.showinfo('Duped', 'Peer slot has no SHA yet.')
+                return
+            elif sha_r and not sha_l:
+                messagebox.showinfo('Duped', 'This slot has no SHA yet.')
+                return
+            else:
+                messagebox.showinfo('Duped', 'Both sides need a file/SHA to mark Same.')
+                return
+        sess['staged_fp'].discard(key)
+        sess['staged_same'].add(key)
+        if self._duped_more_win is not None:
+            self._duped_session_refresh_more()
+        # Skip already-matched pairs in the current walk direction.
+        if not self._duped_session_goto_unmatched():
+            self._duped_session_show()
+
+    def _duped_session_mark_fp(self) -> None:
+        sess = self._session
+        if not sess:
+            return
+        sha_l, sha_r = self._duped_session_current_shas()
+        key = self._session_pair_key(sha_l, sha_r)
+        if key is None and sha_l and sha_r and sha_l == sha_r:
+            key = (sha_l, sha_r)
+        if key is None:
+            return
+        if key in sess['staged_same']:
+            sess['staged_same'].discard(key)
+            self._duped_session_show()
+            if self._duped_more_win is not None:
+                self._duped_session_refresh_more()
+            return
+        sess['staged_fp'].add(key)
+        self._duped_session_show()
+
+    def _duped_session_cancel(self) -> None:
+        self._duped_close_more_win()
+        self._duped_close_compare_win()
+        self._session = None
+
+    def _duped_session_done(self) -> None:
+        sess = self._session
+        if not sess or not self.store:
+            self._duped_session_cancel()
+            return
+        same_pairs = list(sess.get('staged_same') or [])
+        fp_pairs = list(sess.get('staged_fp') or [])
+        focus_key = sess['focus_key']
+        peer_key = sess['peer_key']
+        merged = 0
+        fps = 0
+        try:
+            for a, b in same_pairs:
+                if a == b:
+                    continue
+                if self.store.merge_sha1_match(a, b):
+                    merged += 1
+            for a, b in fp_pairs:
+                if a == b:
+                    continue
+                try:
+                    self.store.mark_dhash_false_positive(a, b)
+                    fps += 1
+                except Exception:
+                    pass
+        except Exception as e:
+            messagebox.showerror('Duped', f'Done failed:\n{e}')
+            return
+        log_feed(
+            log,
+            logging.INFO,
+            'compare session done: %s match merge(s), %s FP',
+            merged,
+            fps,
+        )
+        # Build rows from session Same pairs (include identical-SHA staged pairs).
+        pair_rows = list(same_pairs)
+        self._duped_session_cancel()
+        # Exact tools (Move / Strip) apply to these rows.
+        if self._duped_is_near():
+            try:
+                self.duped_mode_var.set('exact')
+                self._duped_mode = 'exact'
+                self._duped_apply_mode_ui()
+            except Exception:
+                pass
+        # Show every session match — Undecided would hide already-decided homes.
+        try:
+            self.duped_undecided_var.set(False)
+        except Exception:
+            pass
+        self._duped_focus_key = focus_key
+        try:
+            if focus_key in self._duped_rows:
+                self.duped_gallery_tree.selection_set(focus_key)
+                self.duped_gallery_tree.focus(focus_key)
+                self.duped_gallery_tree.see(focus_key)
+        except Exception:
+            pass
+        items = self._duped_items_from_session_pairs(focus_key, peer_key, pair_rows)
+        self._duped_load_file_items(items)
+        n = len(items)
+        self.duped_status.set(
+            f'Session done — {n} matched pair(s) listed. '
+            f'Move to home (uncheck symlinks to delete peers) or Strip peers.'
+        )
+        if n:
+            try:
+                kids = list(self.duped_file_tree.get_children())
+                if kids:
+                    self.duped_file_tree.selection_set(kids)
+                    self.duped_file_tree.focus(kids[0])
+                    self.duped_file_tree.see(kids[0])
+            except Exception:
+                pass
+
+    def _duped_items_from_session_pairs(
+        self,
+        focus_key: str,
+        peer_key: str,
+        pairs: list[tuple[bytes, bytes]],
+    ) -> list[dict]:
+        """Build Duped file-tree rows from staged Same pairs."""
+        out: list[dict] = []
+        seen: set[bytes] = set()
+        for a, b in pairs:
+            # Prefer the digest that has an alias under focus_key as local.
+            local, peer = a, b
+            try:
+                aliases_a = self.store.list_name_aliases(a) if self.store else []
+            except Exception:
+                aliases_a = []
+            try:
+                aliases_b = self.store.list_name_aliases(b) if self.store else []
+            except Exception:
+                aliases_b = []
+            a_here = any((x.get('gallery_key') or '') == focus_key for x in aliases_a)
+            b_here = any((x.get('gallery_key') or '') == focus_key for x in aliases_b)
+            if b_here and not a_here:
+                local, peer = b, a
+                aliases_a, aliases_b = aliases_b, aliases_a
+            if local in seen:
+                continue
+            seen.add(local)
+            merged_aliases = []
+            for src, sha in ((aliases_a, local), (aliases_b, peer)):
+                for x in src:
+                    merged_aliases.append(
+                        {
+                            'name': x.get('name'),
+                            'bare_name': x.get('bare_name'),
+                            'gallery_key': x.get('gallery_key') or '',
+                            'sample_path': x.get('sample_path'),
+                            'sha1': sha,
+                        }
+                    )
+            sample = None
+            home_gk = ''
+            for x in aliases_a:
+                if x.get('sample_path'):
+                    sample = x.get('sample_path')
+                    break
+            for x in aliases_a:
+                if (x.get('gallery_key') or '') == focus_key and x.get('sample_path'):
+                    sample = x.get('sample_path')
+                    home_gk = focus_key
+                    break
+            if self.store:
+                try:
+                    hit = self.store.lookup_sha1(local)
+                except Exception:
+                    hit = None
+                if hit:
+                    sample = sample or hit.get('sample_path')
+                    home_gk = home_gk or (hit.get('gallery_key') or '')
+            out.append(
+                {
+                    'sha1': local,
+                    'sha1_hex': local.hex(),
+                    'sample_path': sample,
+                    'home_gallery_key': home_gk or focus_key,
+                    'byte_len': None,
+                    'seen_count': 0,
+                    'home_decided': False,
+                    'peer_sha1': peer if peer != local else None,
+                    'aliases': merged_aliases,
+                    'match_kind': 'exact' if local == peer else 'match_group',
+                }
+            )
+        out.sort(key=lambda x: x['sha1_hex'])
+        return out
+
+    def _duped_load_file_items(self, files: list[dict]) -> None:
+        """Replace the file tree with ``files`` (UI thread)."""
+        self._duped_hide_preview()
+        self._duped_seq_cache.clear()
+        try:
+            self.duped_file_tree.delete(*self.duped_file_tree.get_children())
+        except tk.TclError:
+            pass
+        self._duped_files.clear()
+        self._duped_file_list = list(files)
+        self._duped_file_pop_gen += 1
+        gen = self._duped_file_pop_gen
+        key = self._duped_focus_key or ''
+        near = self._duped_is_near()
+        undecided = bool(self.duped_undecided_var.get())
+        self._duped_populate_files_chunk(gen, key, near, undecided, files, 0)
+
+    def _duped_session_show(self) -> None:
+        sess = self._session
         w = self._duped_cw_widgets
-        if not items or not w or self._duped_compare_win is None:
+        if not sess or not w or self._duped_compare_win is None:
             return
-        index = max(0, min(index, len(items) - 1))
-        self._duped_compare_idx = index
-        item = items[index]
-        focus_key = self._duped_focus_key or ''
-        peer_key = self._duped_peer_key(item, focus_key)
-        left_seq = self._duped_sequence(focus_key) if focus_key else []
-        left_idx = self._duped_index_in_seq(left_seq, item, focus_key) if focus_key else None
-        right_seq: list[dict] = []
-        right_idx = None
-        if peer_key:
-            right_seq = self._duped_sequence(peer_key)
-            right_idx = self._duped_index_in_seq(right_seq, item, peer_key)
-
-        ham = item.get('hamming')
-        kind = item.get('match_kind') or 'exact'
-        if kind == 'manual' or ham == DUPED_MANUAL_HAMMING:
-            dist_txt = 'manual link'
-        elif ham is not None:
-            dist_txt = f'Hamming {ham}'
-        else:
-            dist_txt = 'exact SHA'
-
-        left_slot = left_seq[left_idx] if left_idx is not None and left_seq else {}
-        right_slot = (
-            right_seq[right_idx] if right_idx is not None and right_seq else {}
-        )
-        left_name = left_slot.get('name') or self._duped_alias_name(item, focus_key) or '?'
-        right_name = (
-            right_slot.get('name')
-            or (self._duped_alias_name(item, peer_key) if peer_key else '')
-            or '?'
-        )
+        focus_key = sess['focus_key']
+        peer_key = sess['peer_key']
+        left_seq = self._duped_sequence(focus_key)
+        right_seq = self._duped_sequence(peer_key)
+        li, ri = sess['left_idx'], sess['right_idx']
+        left_slot = left_seq[li] if 0 <= li < len(left_seq) else {}
+        right_slot = right_seq[ri] if 0 <= ri < len(right_seq) else {}
+        left_name = left_slot.get('name') or '?'
+        right_name = right_slot.get('name') or '?'
         left_path = left_slot.get('path')
         right_path = right_slot.get('path')
-
+        sha_l, sha_r = left_slot.get('sha1'), right_slot.get('sha1')
+        key = self._session_pair_key(sha_l, sha_r)
+        if key is None and sha_l and sha_r and sha_l == sha_r:
+            key = (sha_l, sha_r)
+        badge = ''
+        if key and key in sess['staged_same']:
+            badge = 'STAGED: Same'
+        elif key and key in sess['staged_fp']:
+            badge = 'STAGED: False positive'
+        elif sha_l and sha_r and sha_l == sha_r:
+            badge = 'exact SHA (already identical)'
+        off_l = li - sess['anchor_left']
+        off_r = ri - sess['anchor_right']
+        n_same = len(sess['staged_same'])
+        n_fp = len(sess['staged_fp'])
         try:
             w['title'].configure(
-                text=f'#{index + 1} / {len(items)}  ·  {dist_txt}  ·  '
-                f'{focus_key} ↔ {peer_key or "?"}'
+                text=(
+                    f'{focus_key} [{li + 1}/{max(1, len(left_seq))}]  ↔  '
+                    f'{peer_key} [{ri + 1}/{max(1, len(right_seq))}]  ·  '
+                    f'offset {off_l:+d}/{off_r:+d}'
+                )
             )
             w['meta'].configure(
                 text=f'This: {left_path or "(missing)"}\nPeer: {right_path or "(missing)"}'
             )
-            w['left_name'].configure(text=f'{focus_key}\n{left_name}')
-            w['right_name'].configure(
-                text=f'{peer_key or "?"}\n{right_name}' if peer_key else '(no peer)'
+            w['status'].configure(
+                text=f'{badge}   ·   staged Same {n_same} · FP {n_fp}'
+                if badge
+                else f'staged Same {n_same} · FP {n_fp}'
             )
+            w['left_name'].configure(text=f'{focus_key}\n{left_name}')
+            w['right_name'].configure(text=f'{peer_key}\n{right_name}')
             w['left_img'].configure(image='', text='…' if left_path else 'missing')
             w['right_img'].configure(image='', text='…' if right_path else 'missing')
         except Exception:
             return
-
         self._duped_compare_win_photos = []
         box = (DUPED_COMPARE_WIN_W, DUPED_COMPARE_WIN_H)
         if left_path is not None:
             self._duped_queue_thumb(w['left_img'], left_path, box, fast=False)
         if right_path is not None:
             self._duped_queue_thumb(w['right_img'], right_path, box, fast=False)
-
-        # Rebuild Link neighbor buttons
-        link_row = w['link_row']
-        for child in list(link_row.winfo_children()):
-            try:
-                child.destroy()
-            except Exception:
-                pass
-        tk.Label(
-            link_row,
-            text='Link neighbors:',
-            fg='#888',
-            bg='#1e1e1e',
-            font=('Segoe UI', 8),
-        ).pack(side='left')
-        if (
-            peer_key
-            and left_idx is not None
-            and right_idx is not None
-        ):
-            any_btn = False
-            for off in (-3, -2, -1, 1, 2, 3):
-                li = left_idx + off
-                ri = right_idx + off
-                if not (0 <= li < len(left_seq) and 0 <= ri < len(right_seq)):
-                    continue
-                sha_l = left_seq[li].get('sha1')
-                sha_r = right_seq[ri].get('sha1')
-                if not sha_l or not sha_r or sha_l == sha_r:
-                    continue
-                if self._duped_pair_linked(sha_l, sha_r):
-                    ttk.Label(link_row, text=f'{off:+d}✓').pack(side='left', padx=2)
-                    continue
-                any_btn = True
-                name_l = (left_seq[li].get('name') or '')[:24]
-                name_r = (right_seq[ri].get('name') or '')[:24]
-                ttk.Button(
-                    link_row,
-                    text=f'Link {off:+d}',
-                    width=9,
-                    command=lambda a=sha_l, b=sha_r, nl=name_l, nr=name_r: (
-                        self._duped_manual_link(a, b, nl, nr)
-                    ),
-                ).pack(side='left', padx=2)
-            if not any_btn:
-                tk.Label(
-                    link_row,
-                    text='all neighbor offsets linked or missing',
-                    fg='#666',
-                    bg='#1e1e1e',
-                    font=('Segoe UI', 8),
-                ).pack(side='left', padx=4)
-        else:
-            tk.Label(
-                link_row,
-                text='(need both sequences for Link)',
-                fg='#666',
-                bg='#1e1e1e',
-                font=('Segoe UI', 8),
-            ).pack(side='left', padx=4)
-
         try:
             self._duped_compare_win.title(
-                f'Duped compare — #{index + 1}/{len(items)} {dist_txt}'
+                f'Duped session — Same {n_same} · FP {n_fp}'
             )
         except Exception:
             pass
 
+    def _duped_session_staged_shas(self) -> set[bytes]:
+        sess = self._session
+        out: set[bytes] = set()
+        if not sess:
+            return out
+        for a, b in sess.get('staged_same') or []:
+            out.add(a)
+            out.add(b)
+        return out
 
-    def _duped_append_match_card(self, parent, item: dict, *, index: int):
-        focus_key = self._duped_focus_key or ''
-        peer_key = self._duped_peer_key(item, focus_key)
-        left_seq = self._duped_sequence(focus_key)
-        left_idx = self._duped_index_in_seq(left_seq, item, focus_key)
-        right_seq: list[dict] = []
-        right_idx = None
-        if peer_key:
-            right_seq = self._duped_sequence(peer_key)
-            right_idx = self._duped_index_in_seq(right_seq, item, peer_key)
-
-        ham = item.get('hamming')
-        kind = item.get('match_kind') or 'exact'
-        if kind == 'manual' or ham == DUPED_MANUAL_HAMMING:
-            dist_txt = 'manual'
-        elif ham is not None:
-            dist_txt = f'Hamming {ham}'
-        else:
-            dist_txt = 'exact SHA'
-
-        card = tk.Frame(parent, bg='#252526', highlightbackground='#444', highlightthickness=1)
-        card.pack(fill='x', padx=4, pady=6)
-        card._duped_iid = item.get('sha1_hex') or ''  # type: ignore[attr-defined]
-        card._duped_board_index = index  # type: ignore[attr-defined]
-
-        head = tk.Frame(card, bg='#252526')
-        head.pack(fill='x', padx=6, pady=4)
-        tk.Label(
-            head,
-            text=f'#{index + 1}  {dist_txt}  ·  {focus_key} ↔ {peer_key or "?"}',
+    def _duped_session_open_more(self) -> None:
+        sess = self._session
+        if not sess:
+            return
+        self._duped_close_more_win()
+        win = tk.Toplevel(self._duped_compare_win or self)
+        win.title('More — pick This + Peer')
+        win.configure(background='#1e1e1e')
+        try:
+            win.geometry('980x640')
+            win.minsize(640, 400)
+        except Exception:
+            pass
+        win.protocol('WM_DELETE_WINDOW', self._duped_close_more_win)
+        hint = tk.Label(
+            win,
+            text='Click one This (blue) and one Peer (orange). Staged Same are hidden.',
             fg='#ccc',
-            bg='#252526',
-            font=('Segoe UI', 9, 'bold'),
-        ).pack(side='left')
-        ttk.Button(
-            head,
-            text='Compare',
-            width=10,
-            command=lambda i=index: self._duped_open_compare(i),
-        ).pack(side='right', padx=2)
-        if item.get('peer_sha1') or kind in ('near', 'manual'):
-            ttk.Button(
-                head,
-                text='False positive',
-                width=14,
-                command=lambda it=item: self._duped_fp_one(it),
-            ).pack(side='right', padx=2)
-
-        strips = tk.Frame(card, bg='#252526')
-        strips.pack(fill='x', padx=4, pady=2)
-        self._duped_build_board_strip(
-            strips,
-            gallery_key=focus_key,
-            seq=left_seq,
-            center_idx=left_idx,
-            border=DUPED_COLOR_LEFT,
-            title='This',
-            photo_bucket=self._duped_compare_photos,
+            bg='#1e1e1e',
+            font=('Segoe UI', 9),
         )
-        if peer_key:
-            self._duped_build_board_strip(
-                strips,
-                gallery_key=peer_key,
-                seq=right_seq,
-                center_idx=right_idx,
-                border=DUPED_COLOR_RIGHT,
-                title='Peer',
-                photo_bucket=self._duped_compare_photos,
-            )
-        else:
-            tk.Label(
-                strips, text='(no peer)', fg='#888', bg='#252526'
-            ).pack(side='left', padx=12)
+        hint.pack(anchor='w', padx=8, pady=6)
+        body = tk.Frame(win, bg='#1e1e1e')
+        body.pack(fill='both', expand=True, padx=6, pady=4)
+        left_fr = tk.Frame(body, bg='#1e1e1e')
+        right_fr = tk.Frame(body, bg='#1e1e1e')
+        left_fr.pack(side='left', fill='both', expand=True, padx=(0, 4))
+        right_fr.pack(side='left', fill='both', expand=True, padx=(4, 0))
+        self._duped_more_win = win
+        self._duped_more_photos = []
+        self._duped_cw_widgets['more_left'] = left_fr
+        self._duped_cw_widgets['more_right'] = right_fr
+        self._duped_cw_widgets['more_hint'] = hint
+        self._duped_session_refresh_more()
 
-        # Neighbor Link buttons for same relative offset when not already linked.
-        link_row = tk.Frame(card, bg='#252526')
-        link_row.pack(fill='x', padx=6, pady=(0, 6))
-        tk.Label(
-            link_row,
-            text='Link neighbors:',
-            fg='#888',
-            bg='#252526',
-            font=('Segoe UI', 8),
-        ).pack(side='left')
-        if (
-            peer_key
-            and left_idx is not None
-            and right_idx is not None
-        ):
-            any_btn = False
-            for off in (-3, -2, -1, 1, 2, 3):
-                li = left_idx + off
-                ri = right_idx + off
-                if not (0 <= li < len(left_seq) and 0 <= ri < len(right_seq)):
-                    continue
-                sha_l = left_seq[li].get('sha1')
-                sha_r = right_seq[ri].get('sha1')
-                if not sha_l or not sha_r or sha_l == sha_r:
-                    continue
-                if self._duped_pair_linked(sha_l, sha_r):
-                    ttk.Label(link_row, text=f'±{off}✓').pack(side='left', padx=2)
-                    continue
-                any_btn = True
-                name_l = (left_seq[li].get('name') or '')[:18]
-                name_r = (right_seq[ri].get('name') or '')[:18]
-                ttk.Button(
-                    link_row,
-                    text=f'Link {off:+d}',
-                    width=9,
-                    command=lambda a=sha_l, b=sha_r, nl=name_l, nr=name_r: (
-                        self._duped_manual_link(a, b, nl, nr)
-                    ),
-                ).pack(side='left', padx=2)
-            if not any_btn:
-                tk.Label(
-                    link_row,
-                    text='all neighbor offsets already linked or missing',
-                    fg='#666',
-                    bg='#252526',
-                    font=('Segoe UI', 8),
-                ).pack(side='left', padx=4)
-        else:
-            tk.Label(
-                link_row,
-                text='(need both sequences to suggest neighbor Links)',
-                fg='#666',
-                bg='#252526',
-                font=('Segoe UI', 8),
-            ).pack(side='left', padx=4)
+    def _duped_session_refresh_more(self) -> None:
+        sess = self._session
+        left_fr = self._duped_cw_widgets.get('more_left')
+        right_fr = self._duped_cw_widgets.get('more_right')
+        if not sess or left_fr is None or right_fr is None:
+            return
+        for fr in (left_fr, right_fr):
+            for child in list(fr.winfo_children()):
+                try:
+                    child.destroy()
+                except Exception:
+                    pass
+        excluded = self._duped_session_staged_shas()
+        self._duped_more_photos = []
+        self._duped_fill_more_side(
+            left_fr,
+            sess['focus_key'],
+            side='left',
+            border=DUPED_COLOR_LEFT,
+            excluded=excluded,
+        )
+        self._duped_fill_more_side(
+            right_fr,
+            sess['peer_key'],
+            side='right',
+            border=DUPED_COLOR_RIGHT,
+            excluded=excluded,
+        )
 
-        # Bind wheel on card widgets
-        canvas = self._duped_board_canvas
-
-        def _wheel(event, c=canvas):
-            if c is None:
-                return
-            c.yview_scroll(int(-event.delta / 120), 'units')
-            self._duped_board_maybe_load_more()
-
-        for w in (card, head, strips, link_row):
-            w.bind('<MouseWheel>', _wheel)
-            w.bind('<Double-1>', lambda _e, i=index: self._duped_open_compare(i))
-
-        def _bind_dbl(widget, i=index):
-            widget.bind('<Double-1>', lambda _e, idx=i: self._duped_open_compare(idx))
-            for child in widget.winfo_children():
-                _bind_dbl(child)
-
-        _bind_dbl(strips)
-
-
-    def _duped_build_board_strip(
+    def _duped_fill_more_side(
         self,
         parent,
-        *,
         gallery_key: str,
-        seq: list[dict],
-        center_idx: int | None,
+        *,
+        side: str,
         border: str,
-        title: str,
-        photo_bucket: list,
+        excluded: set[bytes],
     ) -> None:
-        """Horizontal strip of ±3 neighbors; thumbs load async."""
-        col = tk.Frame(
-            parent,
-            bg='#1a1a1a',
-            highlightbackground=border,
-            highlightthickness=2,
-        )
-        col.pack(side='left', padx=4, pady=2, fill='y')
         tk.Label(
-            col,
-            text=f'{title}  {gallery_key}',
+            parent,
+            text=f'{"This" if side == "left" else "Peer"}  {gallery_key}',
             fg=border,
-            bg='#1a1a1a',
-            font=('Segoe UI', 8, 'bold'),
-        ).pack(pady=(2, 0))
-        if center_idx is None:
-            tk.Label(col, text='(no seq)', fg='#aaa', bg='#1a1a1a').pack(padx=6, pady=6)
-            return
-        row = tk.Frame(col, bg='#1a1a1a')
-        row.pack(padx=2, pady=2)
-        radius = DUPED_NEIGHBOR_RADIUS
-        start = max(0, center_idx - radius)
-        end = min(len(seq), center_idx + radius + 1)
-        box = (DUPED_BOARD_THUMB_W, DUPED_BOARD_THUMB_H)
-        for i in range(start, end):
-            slot = seq[i]
-            name = slot.get('name') or '?'
-            path = slot.get('path')
-            is_focus = i == center_idx
-            cell_border = DUPED_COLOR_FOCUS if is_focus else border
-            cell = tk.Frame(
-                row,
-                bg='#111',
-                highlightbackground=cell_border,
-                highlightthickness=3 if is_focus else 1,
-            )
-            cell.pack(side='left', padx=2, pady=2)
-            lbl = tk.Label(
-                cell,
-                text='…' if path is not None else 'miss',
-                width=8,
-                height=5,
-                fg='#888' if path is not None else '#f6ad55',
-                bg='#111',
-            )
-            lbl.pack()
-            if path is not None:
-                self._duped_queue_thumb(lbl, path, box)
-            tk.Label(
-                cell,
-                text=name[:16],
-                fg='#eee' if is_focus else '#999',
-                bg='#111',
-                font=('Segoe UI', 6, 'bold' if is_focus else 'normal'),
-            ).pack()
+            bg='#1e1e1e',
+            font=('Segoe UI', 9, 'bold'),
+        ).pack(anchor='w')
+        canvas = tk.Canvas(parent, bg='#151515', highlightthickness=0)
+        scroll = ttk.Scrollbar(parent, orient='vertical', command=canvas.yview)
+        canvas.configure(yscrollcommand=scroll.set)
+        scroll.pack(side='right', fill='y')
+        canvas.pack(side='left', fill='both', expand=True)
+        inner = tk.Frame(canvas, bg='#151515')
+        win_id = canvas.create_window((0, 0), window=inner, anchor='nw')
 
+        def _on_inner(_e=None):
+            canvas.configure(scrollregion=canvas.bbox('all'))
+
+        def _on_canvas(event):
+            canvas.itemconfigure(win_id, width=event.width)
+
+        inner.bind('<Configure>', _on_inner)
+        canvas.bind('<Configure>', _on_canvas)
+        canvas.bind(
+            '<MouseWheel>',
+            lambda e: canvas.yview_scroll(int(-e.delta / 120), 'units'),
+        )
+
+        seq = self._duped_sequence(gallery_key)
+        box = (DUPED_MORE_THUMB, DUPED_MORE_THUMB)
+        cols = 3
+        row_fr = None
+        shown = 0
+        for idx, slot in enumerate(seq):
+            sha = slot.get('sha1')
+            if sha and sha in excluded:
+                continue
+            path = slot.get('path')
+            if path is None:
+                continue
+            if shown % cols == 0:
+                row_fr = tk.Frame(inner, bg='#151515')
+                row_fr.pack(fill='x', pady=2)
+            cell = tk.Frame(
+                row_fr,
+                bg='#222',
+                highlightbackground=border,
+                highlightthickness=1,
+            )
+            cell.pack(side='left', padx=3, pady=2)
+            lbl = tk.Label(cell, text='…', fg='#888', bg='#222')
+            lbl.pack(padx=2, pady=2)
+            name = (slot.get('name') or '')[:28]
+            tk.Label(
+                cell, text=name, fg='#bbb', bg='#222', font=('Segoe UI', 7)
+            ).pack()
+            self._duped_queue_thumb(lbl, path, box, fast=True)
+            for w in (cell, lbl):
+                w.bind(
+                    '<Button-1>',
+                    lambda _e, s=side, i=idx: self._duped_more_pick(s, i),
+                )
+            shown += 1
+
+    def _duped_more_pick(self, side: str, index: int) -> None:
+        sess = self._session
+        if not sess:
+            return
+        if side == 'left':
+            sess['more_pick_left'] = int(index)
+        else:
+            sess['more_pick_right'] = int(index)
+        left_i = sess.get('more_pick_left')
+        right_i = sess.get('more_pick_right')
+        hint = self._duped_cw_widgets.get('more_hint')
+        if left_i is None or right_i is None:
+            if hint is not None:
+                missing = 'Peer' if left_i is not None else 'This'
+                try:
+                    hint.configure(text=f'Selected {side}; now click {missing}.')
+                except Exception:
+                    pass
+            return
+        sess['left_idx'] = int(left_i)
+        sess['right_idx'] = int(right_i)
+        sess['more_pick_left'] = None
+        sess['more_pick_right'] = None
+        self._duped_close_more_win()
+        self._duped_session_show()
 
     def _duped_fp_one(self, item: dict):
         peer = item.get('peer_sha1')
@@ -2202,52 +2249,7 @@ class DupedTab(ttk.Frame):
             messagebox.showerror('Duped', f'False positive failed:\n{e}')
             return
         log_feed(log, logging.INFO, 'dHash FP one %s', (item.get('sha1_hex') or '')[:10])
-        was_open = self._duped_compare_win is not None
-        stay = self._duped_compare_idx
-        if was_open:
-            self._duped_compare_reopen_after_refresh = stay
-        # Refresh list + board for current gallery
         self._on_duped_gallery_select()
-
-
-    def _duped_manual_link(
-        self, sha_a: bytes, sha_b: bytes, name_a: str, name_b: str
-    ):
-        if not self.store:
-            return
-        if not messagebox.askyesno(
-            'Duped',
-            f'Manually link neighbors?\n\n{name_a}\n↔\n{name_b}\n\n'
-            'Stored as a near pair (source=manual). Survives Rebuild.',
-        ):
-            return
-        try:
-            self.store.add_manual_near_pair(sha_a, sha_b)
-        except Exception as e:
-            messagebox.showerror('Duped', f'Link failed:\n{e}')
-            return
-        from image_dhash import order_sha_pair
-
-        self._duped_linked_pairs.add(order_sha_pair(sha_a, sha_b))
-        self.duped_status.set(f'Linked {name_a} ↔ {name_b}')
-        log_feed(log, logging.INFO, 'manual near link %s ↔ %s', name_a, name_b)
-        was_open = self._duped_compare_win is not None
-        if was_open:
-            self._duped_compare_reopen_after_refresh = self._duped_compare_idx
-        # Soft refresh board so Link buttons update; keep gallery selection.
-        self._on_duped_gallery_select()
-
-
-    def _duped_show_compare(self, item: dict):
-        """Open large compare for this match item."""
-        hex_id = item.get('sha1_hex') or ''
-        for i, it in enumerate(self._duped_board_items or self._duped_files):
-            if (it.get('sha1_hex') or '') == hex_id or it is item:
-                self._duped_open_compare(i)
-                return
-        if item in (self._duped_files or []):
-            self._duped_board_items = list(self._duped_files)
-            self._duped_open_compare(self._duped_files.index(item))
 
 
     def duped_refresh(self):
@@ -2258,24 +2260,52 @@ class DupedTab(ttk.Frame):
             messagebox.showinfo('Duped', 'Busy — wait for the current job.')
             return
         near = self._duped_is_near()
-        try:
-            if near:
-                rows = self.store.list_near_dupe_galleries(limit=500)
-            else:
-                rows = self.store.list_dupe_galleries(
-                    limit=500,
-                    undecided_only=bool(self.duped_undecided_var.get()),
-                )
-        except Exception as e:
-            messagebox.showerror('Duped', f'Query failed:\n{e}')
-            return
+        undecided = bool(self.duped_undecided_var.get())
+        self._duped_busy = True
+        self.duped_status.set('Refreshing galleries…')
         prev_sel = list(self.duped_gallery_tree.selection())
+
+        def work():
+            try:
+                if near:
+                    rows = self.store.list_near_dupe_galleries(limit=500)
+                else:
+                    rows = self.store.list_dupe_galleries(
+                        limit=500,
+                        undecided_only=undecided,
+                    )
+                err = None
+            except Exception as e:
+                rows = []
+                err = e
+            self._ui_schedule(
+                lambda: self._duped_refresh_apply(rows, err, near, undecided, prev_sel)
+            )
+
+        threading.Thread(target=work, daemon=True, name='duped-refresh').start()
+
+    def _duped_refresh_apply(
+        self,
+        rows: list[dict],
+        err: Exception | None,
+        near: bool,
+        undecided: bool,
+        prev_sel: list[str],
+    ):
+        self._duped_busy = False
+        if not self._lifecycle_alive:
+            return
+        if err is not None:
+            messagebox.showerror('Duped', f'Query failed:\n{err}')
+            self.duped_status.set('Refresh failed')
+            return
         self._duped_rows.clear()
         self._duped_seq_cache.clear()
         self._duped_clear_compare()
         self.duped_gallery_tree.delete(*self.duped_gallery_tree.get_children())
         self.duped_file_tree.delete(*self.duped_file_tree.get_children())
         self._duped_files.clear()
+        self._duped_file_list = []
         for row in rows:
             key = row['gallery_key']
             folder = ''
@@ -2299,7 +2329,7 @@ class DupedTab(ttk.Frame):
             iid = key
             self._duped_rows[iid] = row
             shared = row.get('undecided_count')
-            if near or shared is None or not self.duped_undecided_var.get():
+            if near or shared is None or not undecided:
                 shared = row.get('shared_count') or 0
             self.duped_gallery_tree.insert(
                 '',
@@ -2325,7 +2355,7 @@ class DupedTab(ttk.Frame):
                 f'{len(rows)} gallery(ies) with near matches{fill}'
             )
         else:
-            mode = 'undecided' if self.duped_undecided_var.get() else 'all'
+            mode = 'undecided' if undecided else 'all'
             self.duped_status.set(
                 f'{len(rows)} gallery(ies) ({mode}) with shared files'
             )
@@ -2376,10 +2406,9 @@ class DupedTab(ttk.Frame):
         except tk.TclError:
             pass
         self._duped_files.clear()
+        self._duped_file_list = list(files)
         self._duped_file_pop_gen += 1
         gen = self._duped_file_pop_gen
-        # Board first (lazy cards) so UI stays interactive while tree fills.
-        self._duped_rebuild_board(files)
         if near:
             self.duped_status.set(
                 f'{key}: loading {len(files)} near match(es)…'
@@ -2466,12 +2495,12 @@ class DupedTab(ttk.Frame):
         self._duped_sort_by('file', col)
         if near:
             self.duped_status.set(
-                f'{key}: {len(files)} near match(es) — double-click Compare window'
+                f'{key}: {len(files)} near match(es) — double-click compare session'
             )
         else:
             mode = 'undecided' if undecided else 'all'
             self.duped_status.set(
-                f'{key}: {len(files)} shared ({mode}) — board + hover ±3'
+                f'{key}: {len(files)} shared ({mode}) — double-click compare session'
             )
 
 
@@ -2663,7 +2692,41 @@ class DupedTab(ttk.Frame):
 
     def _duped_strip_peers_one(self, item: dict) -> int:
         """Remove peer paths for one SHA. Returns number of paths removed."""
-        aliases = item.get('aliases') or []
+        aliases = list(item.get('aliases') or [])
+        digest = item.get('sha1')
+        # Expand match-group aliases (same as Move).
+        if self.store and digest:
+            try:
+                equiv = set(self.store.equivalent_shas(digest))
+            except Exception:
+                equiv = {digest} if digest else set()
+            peer_sha = item.get('peer_sha1')
+            if peer_sha:
+                equiv.add(peer_sha)
+            seen = {
+                (a.get('gallery_key'), a.get('name'), a.get('sha1')) for a in aliases
+            }
+            for eq in equiv:
+                if eq == digest:
+                    continue
+                try:
+                    extra = self.store.list_name_aliases(eq)
+                except Exception:
+                    extra = []
+                for a in extra:
+                    row = {
+                        'name': a.get('name'),
+                        'bare_name': a.get('bare_name'),
+                        'gallery_key': a.get('gallery_key') or '',
+                        'sample_path': a.get('sample_path'),
+                        'sha1': eq,
+                    }
+                    sig = (row['gallery_key'], row['name'], eq)
+                    if sig in seen:
+                        continue
+                    seen.add(sig)
+                    aliases.append(row)
+
         real = resolve_real_file(item.get('sample_path'))
         if real is None:
             for a in aliases:
@@ -2676,10 +2739,11 @@ class DupedTab(ttk.Frame):
             )
 
         home_key = (item.get('home_gallery_key') or '').strip()
+        focus = self._duped_focus_key or home_key
         removed = 0
         for a in aliases:
             gkey = (a.get('gallery_key') or '').strip()
-            if not gkey or (home_key and gkey == home_key):
+            if not gkey or (focus and gkey == focus) or (home_key and gkey == home_key):
                 continue
             gal = None
             try:
@@ -2693,9 +2757,16 @@ class DupedTab(ttk.Frame):
             if not peer_name:
                 continue
             peer_path = Path(out) / peer_name
+            a_sha = a.get('sha1')
             status = strip_peer_presence(peer_path, real_keep=real)
             if status in ('link', 'dup'):
                 removed += 1
+                continue
+            # Match-group peer may differ in size — still strip when confirmed.
+            if a_sha and digest and a_sha != digest:
+                st = remove_peer_any(peer_path, real_keep=real)
+                if st in ('link', 'file'):
+                    removed += 1
         return removed
 
 
@@ -2708,7 +2779,41 @@ class DupedTab(ttk.Frame):
         create_links: bool,
     ) -> None:
         digest = item['sha1']
-        aliases = item.get('aliases') or []
+        aliases = list(item.get('aliases') or [])
+        # Expand match-group members so peer galleries of equivalent SHAs are handled.
+        equiv: set[bytes] = {digest}
+        if self.store:
+            try:
+                equiv = set(self.store.equivalent_shas(digest))
+            except Exception:
+                equiv = {digest}
+        peer_sha = item.get('peer_sha1')
+        if peer_sha:
+            equiv.add(peer_sha)
+        seen_alias: set[tuple] = {
+            (a.get('gallery_key'), a.get('name'), a.get('sha1')) for a in aliases
+        }
+        for eq in equiv:
+            if eq == digest or not self.store:
+                continue
+            try:
+                extra = self.store.list_name_aliases(eq)
+            except Exception:
+                extra = []
+            for a in extra:
+                row = {
+                    'name': a.get('name'),
+                    'bare_name': a.get('bare_name'),
+                    'gallery_key': a.get('gallery_key') or '',
+                    'sample_path': a.get('sample_path'),
+                    'sha1': eq,
+                }
+                sig = (row['gallery_key'], row['name'], eq)
+                if sig in seen_alias:
+                    continue
+                seen_alias.add(sig)
+                aliases.append(row)
+
         # Preferred name in home gallery.
         home_name = None
         for a in aliases:
@@ -2719,9 +2824,21 @@ class DupedTab(ttk.Frame):
         if not home_name:
             home_name = Path(item.get('sample_path') or 'file.bin').name
 
-        real = resolve_real_file(item.get('sample_path'))
+        # Prefer a real file already under the home folder.
+        real = None
+        for a in aliases:
+            if a.get('gallery_key') != home_key:
+                continue
+            real = resolve_real_file(a.get('sample_path'))
+            if real is None:
+                n = a.get('name') or a.get('bare_name')
+                if n:
+                    real = resolve_real_file(home_dir / n)
+            if real is not None:
+                break
         if real is None:
-            # Try any alias path.
+            real = resolve_real_file(item.get('sample_path'))
+        if real is None:
             for a in aliases:
                 real = resolve_real_file(a.get('sample_path'))
                 if real is not None:
@@ -2737,13 +2854,20 @@ class DupedTab(ttk.Frame):
         else:
             moved = move_real_file(real, dest)
 
-        self.store.set_fingerprint_home(
-            digest,
-            sample_path=str(moved),
-            gallery_key=home_key,
-        )
+        # Point every match-group member at the home file.
+        for eq in equiv:
+            try:
+                self.store.set_fingerprint_home(
+                    eq,
+                    sample_path=str(moved),
+                    gallery_key=home_key,
+                )
+            except Exception as e:
+                if eq == digest:
+                    raise
+                self.ui_log(f'  home meta for {eq.hex()[:10]}: {e}')
 
-        # Peer sites: symlink or remove duplicate presence (aliases stay in DB).
+        # Peer sites: symlink or remove presence (aliases stay in DB).
         for a in aliases:
             gkey = a.get('gallery_key') or ''
             if not gkey or gkey == home_key:
@@ -2754,6 +2878,7 @@ class DupedTab(ttk.Frame):
                 continue
             peer_name = a.get('name') or a.get('bare_name') or home_name
             peer_path = Path(out) / peer_name
+            a_sha = a.get('sha1')
             if create_links:
                 status = ensure_symlink(peer_path, moved)
                 if status == 'exists_real' and not same_path(peer_path, moved):
@@ -2763,5 +2888,11 @@ class DupedTab(ttk.Frame):
                     except OSError as e:
                         self.ui_log(f'  peer replace failed {peer_path.name}: {e}')
             else:
-                remove_path_if_link_or_dup(peer_path, real_keep=moved)
+                # Exact dup / symlink, or match-group peer with different bytes.
+                if remove_path_if_link_or_dup(peer_path, real_keep=moved):
+                    continue
+                if a_sha and a_sha != digest:
+                    st = remove_peer_any(peer_path, real_keep=moved)
+                    if st == 'skip':
+                        self.ui_log(f'  peer keep/skip {peer_path}')
 
