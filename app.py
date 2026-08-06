@@ -913,6 +913,14 @@ class App(ttk.Frame):
         self._queue_sources.clear()
         self._refresh_idle_status()
 
+    @staticmethod
+    def _text_at_bottom(widget) -> bool:
+        """True when the viewport already shows the end (tail-follow)."""
+        try:
+            return float(widget.yview()[1]) >= 0.999
+        except (tk.TclError, TypeError, ValueError, IndexError):
+            return True
+
     def ui_log(self, msg):
         if not self._lifecycle_alive:
             return
@@ -921,9 +929,11 @@ class App(ttk.Frame):
             if not self._lifecycle_alive:
                 return
             try:
+                follow = self._text_at_bottom(self.log_box)
                 self.log_box.configure(state='normal')
                 self.log_box.insert('end', msg + '\n')
-                self.log_box.see('end')
+                if follow:
+                    self.log_box.see('end')
                 self.log_box.configure(state='disabled')
             except tk.TclError:
                 pass

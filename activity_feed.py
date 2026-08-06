@@ -143,15 +143,25 @@ class ActivityFeedPanel(ttk.Frame):
         except tk.TclError:
             self._drain_alive = False
 
+    @staticmethod
+    def _text_at_bottom(widget: tk.Text) -> bool:
+        """True when the viewport already shows the end (tail-follow)."""
+        try:
+            return float(widget.yview()[1]) >= 0.999
+        except (tk.TclError, TypeError, ValueError, IndexError):
+            return True
+
     def _append_line(self, line: str, tag: str, levelno: int) -> None:
         try:
             if not self.winfo_exists():
                 return
         except tk.TclError:
             return
+        follow = self._text_at_bottom(self.text)
         self.text.configure(state="normal")
         self.text.insert(tk.END, line + "\n", tag)
-        self.text.see(tk.END)
+        if follow:
+            self.text.see(tk.END)
         self.text.configure(state="disabled")
         if levelno >= logging.ERROR:
             self._error_count += 1
