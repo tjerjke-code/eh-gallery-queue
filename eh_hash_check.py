@@ -35,12 +35,52 @@ BAN_COOLDOWN_MAX = 2 * 60 * 60  # 2 h
 BAN_ERROR_SUBSTR = "ban / bandwidth"
 
 _GALLERY_HREF = re.compile(r"/g/(\d+)/([0-9a-fA-F]+)", re.IGNORECASE)
+# Compact/extended search rows append tag chips; ``f:maid`` / ``m:bald`` etc.
+_EH_COMPACT_NS_TAG = re.compile(r"\s+[a-z]:\S+")
+_EH_META_BRACKET = re.compile(
+    r"^\[(?:"
+    r"AI[\s_-]?Generated|Chinese|English|Korean|Japanese|Spanish|French|"
+    r"Portuguese|Russian|Thai|Vietnamese|German|Italian|Polish|"
+    r"Digital|Incomplete|Ongoing|Rework|Colori[sz]ed|Full[\s_-]?Color|"
+    r"Factory|Raw|Decensored|Uncensored|Extra|Sample"
+    r")\]$",
+    re.IGNORECASE,
+)
+_EH_BARE_TAG_CHIPS = re.compile(
+    r"^[a-z][a-z0-9 .'+-]*(?:\s+[a-z][a-z0-9 .'+-]*)*$"
+)
 _BAN_MARKERS = (
     "temporarily banned",
     "ban expires",
     "exceeded your image",
     "509 bandwidth",
 )
+
+
+def clean_search_hit_title(title: str | None) -> str | None:
+    """Gallery name only — drop EH search-result tag chips after the title.
+
+    Search ``<a href=/g/…>`` often wraps ``.glink`` plus tag text like
+    ``honkai gakuen elysia f:maid m:bald ai generated``. Folder names use
+    the real ``#gn`` title; queue labels should match that.
+    """
+    s = re.sub(r"\s+", " ", (title or "").strip())
+    if not s:
+        return None
+    m = _EH_COMPACT_NS_TAG.search(s)
+    if not m:
+        return s
+    head = s[: m.start()].rstrip()
+    # After a language/meta bracket, EH often lists bare parody/character chips.
+    meta = None
+    for br in re.finditer(r"\[[^\]]*\]", head):
+        if _EH_META_BRACKET.match(br.group(0)):
+            meta = br
+    if meta is not None:
+        after = head[meta.end() :].strip()
+        if after and _EH_BARE_TAG_CHIPS.match(after):
+            head = head[: meta.end()].rstrip()
+    return head or s
 
 OnMatchFn = Callable[[list[dict]], None]
 StatusFn = Callable[[str], None]
@@ -84,7 +124,13 @@ def parse_shash_results(html: str, *, base: str = "https://e-hentai.org/") -> li
             abs_url = urljoin(base, href).split("#", 1)[0].split("?", 1)[0]
             if not abs_url.rstrip("/").endswith(f"/{token}"):
                 abs_url = f"https://e-hentai.org/g/{key}/{token}/"
-            title = a.get_text(" ", strip=True) or None
+            # Prefer .glink (real name); fall back to link text then strip tags.
+            glink = a.find(class_="glink")
+            if glink is not None:
+                title = glink.get_text(" ", strip=True) or None
+            else:
+                title = a.get_text(" ", strip=True) or None
+            title = clean_search_hit_title(title)
             if title and len(title) < 2:
                 title = None
             found.append(

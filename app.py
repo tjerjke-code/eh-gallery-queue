@@ -28,7 +28,7 @@ from db import (
     normalize_image_links,
     strip_order_prefix,
 )
-from eh_hash_check import EhHashCheckWorker, SEARCH_INTERVAL
+from eh_hash_check import EhHashCheckWorker, SEARCH_INTERVAL, clean_search_hit_title
 from eh_title_search import (
     default_session,
     search_by_folder_name,
@@ -3036,6 +3036,7 @@ class App(ttk.Frame):
             if any(gallery_key_from_url(u) == key for u in self._queue_urls):
                 continue
             title = (m.get('title') or '').strip() or None
+            title = clean_search_hit_title(title)
             try:
                 if self.store.is_completed(url) or self.store.is_queued(url):
                     continue
@@ -3070,7 +3071,7 @@ class App(ttk.Frame):
         return base
 
     def _remember_queue_title(self, url: str, title: str | None):
-        t = (title or '').strip()
+        t = clean_search_hit_title(title) or ''
         if t:
             self._queue_titles[url] = t
         elif url not in self._queue_titles:
@@ -3326,6 +3327,16 @@ class App(ttk.Frame):
                             self.store.set_gallery_meta(url, title=title)
                         except Exception:
                             pass
+                # Drop EH search tag chips so labels match on-disk folder names.
+                cleaned = clean_search_hit_title(title)
+                if cleaned and cleaned != (title or '').strip():
+                    title = cleaned
+                    try:
+                        self.store.set_gallery_meta(url, title=cleaned)
+                    except Exception:
+                        pass
+                elif cleaned:
+                    title = cleaned
                 total = item.get('image_total')
                 try:
                     total_i = int(total) if total is not None else None
