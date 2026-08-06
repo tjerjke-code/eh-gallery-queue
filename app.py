@@ -28,6 +28,7 @@ from db import (
     normalize_image_links,
     strip_order_prefix,
 )
+from eh_hash_check import EhHashCheckWorker
 from logger import get_logger, log_feed
 
 log = get_logger('app')
@@ -38,6 +39,9 @@ REQUEST_INTERVAL = 0.35
 MAX_RETRIES = 5
 DEFAULT_WORKERS = 4
 WIN_BAD = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+# Listbox colors: manual (default) vs EH-discovered auto-queue.
+AUTO_QUEUE_FG = '#1565c0'
+MANUAL_QUEUE_FG = '#000000'
 
 
 class DownloadStopped(Exception):
@@ -559,7 +563,10 @@ class App(ttk.Frame):
         self._stop = threading.Event()
         self._worker = None
         self._queue_urls = []
+        self._queue_sources: dict[str, str] = {}
         self._current_url = None
+        self._hash_worker: EhHashCheckWorker | None = None
+        self._eh_scan_status = ''
 
         top = ttk.Frame(self, padding=8)
         top.pack(fill='x')
@@ -575,6 +582,13 @@ class App(ttk.Frame):
         self.workers_var = tk.IntVar(value=DEFAULT_WORKERS)
         ttk.Spinbox(opts, from_=1, to=8, width=4, textvariable=self.workers_var).pack(side='left', padx=4)
         ttk.Label(opts, text='(3–4 safe · higher = faster, more ban risk)').pack(side='left')
+        self.eh_scan_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            opts,
+            text='EH dupe scan',
+            variable=self.eh_scan_var,
+            command=self._on_eh_scan_toggle,
+        ).pack(side='right')
 
         add_row = ttk.Frame(self, padding=(8, 4))
         add_row.pack(fill='x')
@@ -590,7 +604,14 @@ class App(ttk.Frame):
 
         left = ttk.Frame(mid)
         left.pack(side='left', fill='both', expand=True)
-        ttk.Label(left, text='Parse queue').pack(anchor='w')
+        q_head = ttk.Frame(left)
+        q_head.pack(fill='x')
+        ttk.Label(q_head, text='Parse queue').pack(side='left')
+        ttk.Label(
+            q_head,
+            text='(blue = auto from EH hash)',
+            foreground=AUTO_QUEUE_FG,
+        ).pack(side='right')
         self.listbox = tk.Listbox(left, height=10, selectmode='extended')
         self.listbox.pack(fill='both', expand=True)
         btns = ttk.Frame(left)
@@ -616,6 +637,7 @@ class App(ttk.Frame):
         ttk.Label(self, textvariable=self.status, padding=8).pack(fill='x')
 
         self._hydrate_from_store()
+        self._start_hash_worker()
         log_feed(log, logging.INFO, 'UI ready')
 
     def _request_reload(self):
@@ -627,6 +649,13 @@ class App(ttk.Frame):
         """Stop workers before the shell destroys this frame (WishAssistance-style)."""
         self._lifecycle_alive = False
         self._stop.set()
+        hw = self._hash_worker
+        self._hash_worker = None
+        if hw:
+            try:
+                hw.stop(join_timeout=1.0)
+            except Exception:
+                pass
         if self._current_url and self.store:
             try:
                 self.store.mark_stopped(self._current_url)
@@ -638,6 +667,138 @@ class App(ttk.Frame):
         self._worker = None
         self._current_url = None
         log.info('prepare_for_reload: workers stopped')
+
+    def _start_hash_worker(self):
+        if not self.store or self._hash_worker:
+            return
+        saved = None
+        try:
+            saved = self.store.get_setting('eh_dupe_scan')
+        except Exception:
+            pass
+        if saved is not None:
+            self.eh_scan_var.set(saved not in ('0', 'false', 'False', 'no'))
+        self._hash_worker = EhHashCheckWorker(
+            self.store,
+            on_matches=self._on_eh_matches,
+            on_status=self._on_eh_scan_status,
+            lifecycle_alive=lambda: self._lifecycle_alive,
+            enabled=lambda: bool(self.eh_scan_var.get()),
+        )
+        self._hash_worker.start()
+
+    def _on_eh_scan_toggle(self):
+        if self.store:
+            try:
+                self.store.set_setting(
+                    'eh_dupe_scan',
+                    '1' if self.eh_scan_var.get() else '0',
+                )
+            except Exception:
+                pass
+        if self.eh_scan_var.get():
+            self.ui_log('EH dupe scan enabled')
+        else:
+            self.ui_log('EH dupe scan paused')
+
+    def _on_eh_scan_status(self, text: str):
+        self._eh_scan_status = text or ''
+        if not self._lifecycle_alive:
+            return
+        # Don't clobber an active download status line.
+        if self._worker and self._worker.is_alive():
+            return
+        try:
+            self.after(0, lambda t=text: self._refresh_idle_status(t))
+        except tk.TclError:
+            pass
+
+    def _refresh_idle_status(self, scan_text: str | None = None):
+        if not self._lifecycle_alive:
+            return
+        if self._worker and self._worker.is_alive():
+            return
+        n = len(self._queue_urls)
+        auto_n = sum(
+            1 for u in self._queue_urls
+            if self._queue_sources.get(u) == 'auto'
+        )
+        base = f'Idle — {n} in queue'
+        if auto_n:
+            base += f' ({auto_n} auto)'
+        extra = scan_text if scan_text is not None else self._eh_scan_status
+        if extra:
+            base = f'{base} · {extra}'
+        try:
+            self.status.set(base)
+        except tk.TclError:
+            pass
+
+    def _on_eh_matches(self, matches: list[dict]):
+        """Called from hash-check thread — marshal to UI thread."""
+        if not self._lifecycle_alive or not matches:
+            return
+        try:
+            self.after(0, lambda m=list(matches): self._auto_enqueue_matches(m))
+        except tk.TclError:
+            pass
+
+    def _auto_enqueue_matches(self, matches: list[dict]):
+        if not self._lifecycle_alive or not self.store:
+            return
+        added = 0
+        for m in matches:
+            url = (m.get('url') or '').strip()
+            if not url or not gallery_key_from_url(url):
+                continue
+            key = gallery_key_from_url(url)
+            if any(gallery_key_from_url(u) == key for u in self._queue_urls):
+                continue
+            try:
+                if self.store.is_completed(url) or self.store.is_queued(url):
+                    continue
+                self.store.enqueue(url, source='auto')
+            except Exception as e:
+                self.ui_log(f'Auto-queue failed: {e}')
+                continue
+            self._insert_queue_url(url, source='auto')
+            added += 1
+            if self._worker and self._worker.is_alive():
+                self.job_queue.put(url)
+            title = (m.get('title') or '')[:60]
+            self.ui_log(
+                f'  auto-queued {key}' + (f' — {title}' if title else '')
+            )
+        if added:
+            log_feed(log, logging.INFO, 'Auto-queued %s gallery(ies) from EH hash', added)
+            self._refresh_idle_status()
+
+    def _insert_queue_url(self, url: str, *, source: str = 'manual'):
+        """Keep manuals ahead of autos in the listbox."""
+        src = 'auto' if source == 'auto' else 'manual'
+        if src == 'auto':
+            self._queue_urls.append(url)
+            self._queue_sources[url] = 'auto'
+            self.listbox.insert('end', url)
+            try:
+                self.listbox.itemconfig('end', foreground=AUTO_QUEUE_FG)
+            except tk.TclError:
+                pass
+            return
+        idx = next(
+            (
+                i for i, u in enumerate(self._queue_urls)
+                if self._queue_sources.get(u) == 'auto'
+            ),
+            len(self._queue_urls),
+        )
+        self._queue_urls.insert(idx, url)
+        self._queue_sources[url] = 'manual'
+        self.listbox.insert(idx, url)
+        try:
+            self.listbox.itemconfig(idx, foreground=MANUAL_QUEUE_FG)
+        except tk.TclError:
+            pass
 
     def _hydrate_from_store(self):
         if not self.store:
@@ -664,15 +825,15 @@ class App(ttk.Frame):
                         pass
                 if url in self._queue_urls:
                     continue
-                self._queue_urls.append(url)
-                self.listbox.insert('end', url)
+                src = item.get('source') or 'manual'
+                self._insert_queue_url(url, source=src)
                 restored += 1
             src = getattr(self.store, '_parts', {}).get('source', '?')
             self.ui_log(f'DB: EH ready (settings from {src})')
             if restored:
                 self.ui_log(f'Restored {restored} queue item(s) from DB')
                 log_feed(log, logging.INFO, 'Restored %s queue item(s)', restored)
-            self.set_status(f'Idle — {len(self._queue_urls)} in queue')
+            self._refresh_idle_status()
         except Exception as e:
             self.ui_log(f'DB hydrate failed: {e}')
             log.exception('hydrate failed: %s', e)
@@ -709,18 +870,20 @@ class App(ttk.Frame):
                         'Add to queue again anyway?',
                     ):
                         return
-                self.store.enqueue(url)
+                self.store.enqueue(url, source='manual')
             except Exception as e:
                 messagebox.showerror('Database', f'Could not enqueue:\n{e}')
                 return
-        self._queue_urls.append(url)
-        self.listbox.insert('end', url)
+        self._insert_queue_url(url, source='manual')
         log_feed(log, logging.INFO, 'Queued %s', gallery_key_from_url(url) or url)
         if self._worker and self._worker.is_alive():
+            # Manual should run before autos already waiting — rebuild is heavy;
+            # put at front of remaining work by using a side note in status.
             self.job_queue.put(url)
             self.set_status(f'Running — {self.job_queue.qsize()} waiting (+ current)')
         self.url_var.set('')
         self.url_entry.focus_set()
+        self._refresh_idle_status()
 
     def remove_selected(self):
         for i in reversed(self.listbox.curselection()):
@@ -732,6 +895,8 @@ class App(ttk.Frame):
                     self.ui_log(f'DB remove failed: {e}')
             self.listbox.delete(i)
             del self._queue_urls[i]
+            self._queue_sources.pop(url, None)
+        self._refresh_idle_status()
 
     def clear_queue(self):
         if self._worker and self._worker.is_alive():
@@ -745,6 +910,8 @@ class App(ttk.Frame):
                 return
         self.listbox.delete(0, 'end')
         self._queue_urls.clear()
+        self._queue_sources.clear()
+        self._refresh_idle_status()
 
     def ui_log(self, msg):
         if not self._lifecycle_alive:
@@ -926,6 +1093,7 @@ class App(ttk.Frame):
             i = self._queue_urls.index(url)
             del self._queue_urls[i]
             self.listbox.delete(i)
+            # Keep _queue_sources so stop/fail can requeue with same color.
         except (ValueError, tk.TclError):
             pass
 
@@ -934,8 +1102,17 @@ class App(ttk.Frame):
             return
         if url in self._queue_urls:
             return
-        self._queue_urls.insert(0, url)
-        self.listbox.insert(0, url)
+        src = self._queue_sources.get(url, 'manual')
+        if src == 'auto':
+            self._insert_queue_url(url, source='auto')
+        else:
+            self._queue_urls.insert(0, url)
+            self._queue_sources[url] = 'manual'
+            self.listbox.insert(0, url)
+            try:
+                self.listbox.itemconfig(0, foreground=MANUAL_QUEUE_FG)
+            except tk.TclError:
+                pass
 
     def _worker_done(self, done):
         if not self._lifecycle_alive:

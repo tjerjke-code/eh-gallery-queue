@@ -24,7 +24,14 @@
 - Column `image_fingerprints.dhash` exists (nullable BIGINT). Fill when the
   resize pipeline lands; match equal / small Hamming distance.
 
+### Queue filter (manual / auto / all)
+- Status: **open**
+- Parse queue already color-codes auto rows (blue) and keeps them at the end.
+- Optional: filter control if the mixed list gets noisy.
+
 ## Done (recent)
+- EH `f_shash` slow check queue (`eh_sha_checks` / `eh_sha_match_galleries`)
+  + background worker + auto-enqueue (`source=auto`, end of queue)
 - Ordered prefixes (`01_` / `001_` / …) from gallery total
 - SHA-1 fingerprint skip across galleries
 - Backfill rename + fingerprints under `a:\trt\.Pics`

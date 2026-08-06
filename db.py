@@ -339,6 +339,53 @@ class QueueStore:
                 )
                 CREATE INDEX IX_fp_alias_sha
                     ON dbo.image_name_aliases (sha1);
+
+                -- Manual vs auto-discovered queue rows (auto always sorted last).
+                IF COL_LENGTH(N'dbo.queue_items', N'source') IS NULL
+                ALTER TABLE dbo.queue_items ADD
+                    source NVARCHAR(16) NOT NULL
+                        CONSTRAINT DF_queue_source DEFAULT (N'manual');
+
+                -- Slow EH f_shash scan queue (WishAssistance asset_download_queue style).
+                IF OBJECT_ID(N'dbo.eh_sha_checks', N'U') IS NULL
+                CREATE TABLE dbo.eh_sha_checks (
+                    sha1         BINARY(20)   NOT NULL PRIMARY KEY
+                        CONSTRAINT FK_eh_sha_checks_fp
+                        REFERENCES dbo.image_fingerprints(sha1),
+                    status       NVARCHAR(32) NOT NULL
+                        CONSTRAINT DF_eh_sha_status DEFAULT (N'pending'),
+                    match_count  INT NOT NULL
+                        CONSTRAINT DF_eh_sha_matches DEFAULT (0),
+                    last_error   NVARCHAR(1000) NULL,
+                    checked_at   DATETIME2 NULL,
+                    created_at   DATETIME2 NOT NULL
+                        CONSTRAINT DF_eh_sha_created DEFAULT (SYSUTCDATETIME()),
+                    updated_at   DATETIME2 NOT NULL
+                        CONSTRAINT DF_eh_sha_updated DEFAULT (SYSUTCDATETIME())
+                );
+
+                IF NOT EXISTS (
+                    SELECT 1 FROM sys.indexes
+                    WHERE name = N'IX_eh_sha_checks_pending'
+                      AND object_id = OBJECT_ID(N'dbo.eh_sha_checks')
+                )
+                CREATE INDEX IX_eh_sha_checks_pending
+                    ON dbo.eh_sha_checks (status, created_at)
+                    WHERE status = N'pending';
+
+                IF OBJECT_ID(N'dbo.eh_sha_match_galleries', N'U') IS NULL
+                CREATE TABLE dbo.eh_sha_match_galleries (
+                    sha1         BINARY(20)    NOT NULL
+                        CONSTRAINT FK_eh_sha_match_check
+                        REFERENCES dbo.eh_sha_checks(sha1),
+                    gallery_key  NVARCHAR(64)  NOT NULL,
+                    url          NVARCHAR(512) NOT NULL,
+                    title        NVARCHAR(256) NULL,
+                    created_at   DATETIME2 NOT NULL
+                        CONSTRAINT DF_eh_sha_match_created
+                        DEFAULT (SYSUTCDATETIME()),
+                    CONSTRAINT PK_eh_sha_match PRIMARY KEY (sha1, gallery_key)
+                );
                 """
             )
             self._conn().commit()
@@ -510,6 +557,12 @@ class QueueStore:
                 gallery_key=gkey,
                 sample_path=path,
             )
+        # New bytes → enqueue slow EH f_shash cross-check (idempotent).
+        if is_new:
+            try:
+                self.enqueue_sha_check(digest)
+            except Exception:
+                pass
         return is_new
 
     def get_setting(self, key: str, default: str | None = None) -> str | None:
@@ -546,15 +599,22 @@ class QueueStore:
             return bool(row)
 
     def list_active_queue(self) -> list[dict]:
-        """Pending / stopped / failed / running items, ordered for the UI."""
+        """Pending / stopped / failed / running items, ordered for the UI.
+
+        Manual rows sort before auto (source), then by position.
+        """
         with self._lock:
             rows = self._conn().cursor().execute(
                 """
                 SELECT id, gallery_key, url, title, out_dir, status, position,
-                       image_total, saved, skipped, failed, last_error
+                       image_total, saved, skipped, failed, last_error,
+                       COALESCE(source, N'manual')
                 FROM dbo.queue_items
                 WHERE status IN (N'pending', N'stopped', N'failed', N'running')
-                ORDER BY position ASC, id ASC
+                ORDER BY
+                    CASE WHEN COALESCE(source, N'manual') = N'auto' THEN 1 ELSE 0 END,
+                    position ASC,
+                    id ASC
                 """
             ).fetchall()
         return [
@@ -571,15 +631,24 @@ class QueueStore:
                 "skipped": r[9],
                 "failed": r[10],
                 "last_error": r[11],
+                "source": (r[12] or "manual"),
             }
             for r in rows
         ]
 
-    def enqueue(self, url: str, position: int | None = None) -> int:
+    def enqueue(
+        self,
+        url: str,
+        position: int | None = None,
+        *,
+        source: str = "manual",
+    ) -> int:
+        """Insert a gallery URL. ``source='auto'`` always appends after manuals."""
         key = gallery_key_from_url(url)
         if not key:
             raise ValueError("URL is not an e-hentai /g/ gallery link")
         token = gallery_token_from_url(url)
+        src = "auto" if (source or "").strip().lower() == "auto" else "manual"
         with self._lock:
             cur = self._conn().cursor()
             existing = cur.execute(
@@ -589,26 +658,186 @@ class QueueStore:
             if existing:
                 return int(existing[0])
             if position is None:
-                row = cur.execute(
-                    "SELECT ISNULL(MAX(position), -1) + 1 FROM dbo.queue_items"
-                ).fetchone()
-                position = int(row[0]) if row else 0
+                if src == "auto":
+                    row = cur.execute(
+                        "SELECT ISNULL(MAX(position), -1) + 1 FROM dbo.queue_items"
+                    ).fetchone()
+                    position = int(row[0]) if row else 0
+                else:
+                    # Insert after last manual; bump autos so they stay at the end.
+                    row = cur.execute(
+                        """
+                        SELECT ISNULL(MAX(position), -1)
+                        FROM dbo.queue_items
+                        WHERE COALESCE(source, N'manual') <> N'auto'
+                        """
+                    ).fetchone()
+                    position = int(row[0]) + 1 if row else 0
+                    cur.execute(
+                        """
+                        UPDATE dbo.queue_items
+                        SET position = position + 1,
+                            updated_at = SYSUTCDATETIME()
+                        WHERE COALESCE(source, N'manual') = N'auto'
+                          AND position >= ?
+                        """,
+                        position,
+                    )
             cur.execute(
                 """
                 INSERT INTO dbo.queue_items
-                    (gallery_key, url, title, status, position)
+                    (gallery_key, url, title, status, position, source)
                 OUTPUT INSERTED.id
-                VALUES (?, ?, NULL, N'pending', ?)
+                VALUES (?, ?, NULL, N'pending', ?, ?)
                 """,
                 key,
                 url.strip(),
                 position,
+                src,
             )
             qid = int(cur.fetchone()[0])
-            # Keep token available via URL; optional future column fill
             _ = token
             self._conn().commit()
             return qid
+
+    def enqueue_sha_check(self, digest: bytes) -> bool:
+        """Queue a fingerprint for EH f_shash scan. Returns True if newly pending."""
+        if not digest or len(digest) != 20:
+            return False
+        with self._lock:
+            cur = self._conn().cursor()
+            if not cur.execute(
+                "SELECT 1 FROM dbo.image_fingerprints WHERE sha1 = ?", digest
+            ).fetchone():
+                return False
+            row = cur.execute(
+                "SELECT status FROM dbo.eh_sha_checks WHERE sha1 = ?", digest
+            ).fetchone()
+            if row:
+                return False
+            cur.execute(
+                """
+                INSERT INTO dbo.eh_sha_checks (sha1, status)
+                VALUES (?, N'pending')
+                """,
+                digest,
+            )
+            self._conn().commit()
+            return True
+
+    def seed_pending_sha_checks(self, *, limit: int = 5000) -> int:
+        """Enqueue unchecked fingerprints (batch). Returns rows inserted."""
+        with self._lock:
+            cur = self._conn().cursor()
+            cur.execute(
+                """
+                INSERT INTO dbo.eh_sha_checks (sha1, status)
+                SELECT TOP (?) f.sha1, N'pending'
+                FROM dbo.image_fingerprints f
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM dbo.eh_sha_checks c WHERE c.sha1 = f.sha1
+                )
+                ORDER BY f.created_at ASC
+                """,
+                int(limit),
+            )
+            n = int(cur.rowcount or 0)
+            self._conn().commit()
+            return n
+
+    def claim_next_sha_check(self) -> dict | None:
+        """Pick oldest pending sha check (status stays pending until finish)."""
+        with self._lock:
+            cur = self._conn().cursor()
+            row = cur.execute(
+                """
+                SELECT TOP (1) c.sha1, f.gallery_key, f.sample_path
+                FROM dbo.eh_sha_checks c
+                INNER JOIN dbo.image_fingerprints f ON f.sha1 = c.sha1
+                WHERE c.status = N'pending'
+                ORDER BY c.created_at ASC, c.sha1 ASC
+                """
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "sha1": bytes(row[0]),
+            "gallery_key": row[1],
+            "sample_path": row[2],
+        }
+
+    def finish_sha_check(
+        self,
+        digest: bytes,
+        *,
+        matches: list[dict] | None = None,
+        error: str | None = None,
+    ) -> None:
+        """Mark check done/error and upsert discovered gallery URLs."""
+        if not digest or len(digest) != 20:
+            return
+        matches = matches or []
+        status = "error" if error else "done"
+        with self._lock:
+            cur = self._conn().cursor()
+            cur.execute(
+                """
+                UPDATE dbo.eh_sha_checks
+                SET status = ?,
+                    match_count = ?,
+                    last_error = ?,
+                    checked_at = SYSUTCDATETIME(),
+                    updated_at = SYSUTCDATETIME()
+                WHERE sha1 = ?
+                """,
+                status,
+                len(matches),
+                (error or "")[:1000] if error else None,
+                digest,
+            )
+            for m in matches:
+                key = (m.get("gallery_key") or "").strip()[:64]
+                url = (m.get("url") or "").strip()[:512]
+                if not key or not url:
+                    continue
+                title = (m.get("title") or "").strip()[:256] or None
+                cur.execute(
+                    """
+                    MERGE dbo.eh_sha_match_galleries AS t
+                    USING (
+                        SELECT ? AS sha1, ? AS gallery_key, ? AS url, ? AS title
+                    ) AS s
+                    ON t.sha1 = s.sha1 AND t.gallery_key = s.gallery_key
+                    WHEN MATCHED THEN UPDATE SET
+                        url = s.url,
+                        title = COALESCE(s.title, t.title)
+                    WHEN NOT MATCHED THEN INSERT (sha1, gallery_key, url, title)
+                    VALUES (s.sha1, s.gallery_key, s.url, s.title);
+                    """,
+                    digest,
+                    key,
+                    url,
+                    title,
+                )
+            self._conn().commit()
+
+    def count_sha_checks(self, status: str = "pending") -> int:
+        with self._lock:
+            row = self._conn().cursor().execute(
+                "SELECT COUNT(*) FROM dbo.eh_sha_checks WHERE status = ?",
+                status,
+            ).fetchone()
+        return int(row[0] or 0) if row else 0
+
+    def is_queued(self, url: str) -> bool:
+        key = gallery_key_from_url(url)
+        if not key:
+            return False
+        with self._lock:
+            row = self._conn().cursor().execute(
+                "SELECT 1 FROM dbo.queue_items WHERE gallery_key = ?", key
+            ).fetchone()
+        return bool(row)
 
     def remove_by_url(self, url: str) -> None:
         key = gallery_key_from_url(url)

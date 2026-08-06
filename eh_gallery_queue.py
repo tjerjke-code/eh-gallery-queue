@@ -19,6 +19,7 @@ RELOAD_DEPS = (
     'logger',
     'db',
     'activity_feed',
+    'eh_hash_check',
     'app',
 )
 
@@ -255,8 +256,11 @@ class HotReloadShell(tk.Tk):
                     'Quit', 'Downloader is running. Stop and quit?'
                 ):
                     return
-                if hasattr(frame, 'prepare_for_reload'):
-                    frame.prepare_for_reload()
+        if frame is not None and hasattr(frame, 'prepare_for_reload'):
+            try:
+                frame.prepare_for_reload()
+            except Exception:
+                pass
         if self.store is not None:
             try:
                 self.store.close()
