@@ -29,9 +29,10 @@
   resize pipeline lands; match equal / small Hamming distance.
 
 ### Queue filter (manual / auto / all)
-- Status: **open**
-- Parse queue already color-codes auto rows (blue) and keeps them at the end.
-- Optional: filter control if the mixed list gets noisy.
+- Status: **partial**
+- Parse queue color-codes auto rows (blue) and keeps them at the end.
+- Filter bar: name/url substring, `images:N` / `images:>=N`, right-click Copy URL.
+- Optional later: explicit source filter (manual / auto / all) if mixed list stays noisy.
 
 ## Done (recent)
 - Queue: reorder selected rows (↑ ↓ Top Bottom); persists `position`; rebuilds

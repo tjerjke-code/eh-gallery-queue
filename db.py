@@ -887,6 +887,7 @@ class QueueStore:
         position: int | None = None,
         *,
         source: str = "manual",
+        title: str | None = None,
     ) -> int:
         """Insert a gallery URL. ``source='auto'`` always appends after manuals."""
         key = gallery_key_from_url(url)
@@ -894,6 +895,7 @@ class QueueStore:
             raise ValueError("URL is not an e-hentai /g/ gallery link")
         token = gallery_token_from_url(url)
         src = "auto" if (source or "").strip().lower() == "auto" else "manual"
+        title_s = (title or "").strip()[:256] or None
         with self._lock:
             cur = self._conn().cursor()
             existing = cur.execute(
@@ -901,6 +903,18 @@ class QueueStore:
                 key,
             ).fetchone()
             if existing:
+                if title_s:
+                    cur.execute(
+                        """
+                        UPDATE dbo.queue_items
+                        SET title = COALESCE(title, ?),
+                            updated_at = SYSUTCDATETIME()
+                        WHERE gallery_key = ?
+                        """,
+                        title_s,
+                        key,
+                    )
+                    self._conn().commit()
                 return int(existing[0])
             if position is None:
                 if src == "auto":
@@ -933,10 +947,11 @@ class QueueStore:
                 INSERT INTO dbo.queue_items
                     (gallery_key, url, title, status, position, source)
                 OUTPUT INSERTED.id
-                VALUES (?, ?, NULL, N'pending', ?, ?)
+                VALUES (?, ?, ?, N'pending', ?, ?)
                 """,
                 key,
                 url.strip(),
+                title_s,
                 position,
                 src,
             )
@@ -944,6 +959,33 @@ class QueueStore:
             _ = token
             self._conn().commit()
             return qid
+
+    def lookup_gallery_title(self, gallery_key: str) -> str | None:
+        """Best-known title for a gallery (queue, EH hash hits, or completed)."""
+        key = (gallery_key or "").strip()
+        if not key:
+            return None
+        with self._lock:
+            cur = self._conn().cursor()
+            for sql in (
+                """
+                SELECT title FROM dbo.queue_items
+                WHERE gallery_key = ? AND title IS NOT NULL AND LTRIM(RTRIM(title)) <> N''
+                """,
+                """
+                SELECT TOP 1 title FROM dbo.eh_sha_match_galleries
+                WHERE gallery_key = ? AND title IS NOT NULL AND LTRIM(RTRIM(title)) <> N''
+                ORDER BY created_at DESC
+                """,
+                """
+                SELECT title FROM dbo.galleries
+                WHERE gallery_key = ? AND title IS NOT NULL AND LTRIM(RTRIM(title)) <> N''
+                """,
+            ):
+                row = cur.execute(sql, key).fetchone()
+                if row and row[0]:
+                    return str(row[0]).strip()
+        return None
 
     def enqueue_sha_check(self, digest: bytes) -> bool:
         """Queue a fingerprint for EH f_shash scan. Returns True if newly pending.

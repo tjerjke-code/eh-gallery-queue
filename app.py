@@ -60,9 +60,10 @@ REQUEST_INTERVAL = 0.35
 MAX_RETRIES = 5
 DEFAULT_WORKERS = 4
 WIN_BAD = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
-# Listbox colors: manual (default) vs EH-discovered auto-queue.
+# Listbox colors: manual (default) vs EH-discovered auto-queue vs currently parsing.
 AUTO_QUEUE_FG = '#1565c0'
 MANUAL_QUEUE_FG = '#000000'
+RUNNING_QUEUE_FG = '#2e7d32'
 # Duped hover filmstrip: this gallery vs peer.
 DUPED_COLOR_LEFT = '#2B6CB0'
 DUPED_COLOR_RIGHT = '#C05621'
@@ -174,6 +175,7 @@ class EHDownloader:
         interval=REQUEST_INTERVAL,
         store: QueueStore | None = None,
         gallery_url: str | None = None,
+        on_meta=None,
     ):
         self.out_dir = out_dir
         self.log = log
@@ -184,6 +186,7 @@ class EHDownloader:
         self._stats_lock = threading.Lock()
         self.store = store
         self.gallery_url = gallery_url
+        self.on_meta = on_meta
         self._name_total = 1
 
     def _session(self):
@@ -550,6 +553,11 @@ class EHDownloader:
                 )
             except Exception as e:
                 self.log(f'  db meta update failed: {e}')
+        if self.on_meta:
+            try:
+                self.on_meta(title=title_raw, image_total=total or None)
+            except Exception:
+                pass
 
         all_links = normalize_image_links(
             self.collect_links(url, pages),
@@ -643,6 +651,10 @@ class App(ttk.Frame):
         self._worker = None
         self._queue_urls = []
         self._queue_sources: dict[str, str] = {}
+        self._queue_titles: dict[str, str] = {}
+        self._queue_totals: dict[str, int | None] = {}
+        self._queue_view: list[str] = []
+        self._queue_filter_raw = ''
         self._current_url = None
         self._hash_worker: EhHashCheckWorker | None = None
         self._eh_scan_status = ''
@@ -734,8 +746,29 @@ class App(ttk.Frame):
             text='(blue = auto from EH hash)',
             foreground=AUTO_QUEUE_FG,
         ).pack(side='right')
+
+        filt = ttk.Frame(left)
+        filt.pack(fill='x', pady=(2, 4))
+        ttk.Label(filt, text='Filter:').pack(side='left')
+        self.queue_filter_var = tk.StringVar()
+        self.queue_filter_entry = ttk.Entry(filt, textvariable=self.queue_filter_var)
+        self.queue_filter_entry.pack(side='left', fill='x', expand=True, padx=4)
+        self.queue_filter_var.trace_add('write', lambda *_: self._on_queue_filter_changed())
+        ttk.Button(filt, text='Clear', width=6, command=self._clear_queue_filter).pack(
+            side='left'
+        )
+        self.queue_filter_hint = ttk.Label(
+            left,
+            text='name / url · images:42 · images:>=40  ·  ▶ green = parsing (right-click → Copy URL)',
+            foreground='#666666',
+        )
+        self.queue_filter_hint.pack(anchor='w')
+
         self.listbox = tk.Listbox(left, height=10, selectmode='extended')
         self.listbox.pack(fill='both', expand=True)
+        self.listbox.bind('<Button-3>', self._on_queue_context)
+        self._queue_menu = tk.Menu(self, tearoff=0)
+
         btns = ttk.Frame(left)
         btns.pack(fill='x', pady=4)
         ttk.Button(btns, text='Remove', command=self.remove_selected).pack(side='left')
@@ -2360,7 +2393,16 @@ class App(ttk.Frame):
             return
         key = gallery_key_from_url(url)
         if key and not any(gallery_key_from_url(u) == key for u in self._queue_urls):
-            self._insert_queue_url(url, source='manual')
+            row = self._import_rows.get(iid) or {}
+            title = (row.get('match_title') or row.get('name') or '').strip() or None
+            total = row.get('match_image_total')
+            try:
+                total_i = int(total) if total is not None else None
+            except (TypeError, ValueError):
+                total_i = None
+            self._insert_queue_url(
+                url, source='manual', title=title, image_total=total_i
+            )
             if self._worker and self._worker.is_alive():
                 self.job_queue.put(url)
             self._refresh_idle_status()
@@ -2471,7 +2513,11 @@ class App(ttk.Frame):
                     0, lambda u=url, i=iid: self._import_ui_after_enqueue(u, i)
                 )
                 return False
-            self.store.enqueue(url, source='manual')
+            self.store.enqueue(
+                url,
+                source='manual',
+                title=row.get('match_title') or row.get('name'),
+            )
             self.store.set_gallery_meta(
                 url,
                 title=row.get('match_title') or row.get('name'),
@@ -2857,7 +2903,11 @@ class App(ttk.Frame):
                         f'Gallery {key} is already completed.\nEnqueue to verify/fill gaps?',
                     ):
                         continue
-                self.store.enqueue(url, source='manual')
+                self.store.enqueue(
+                    url,
+                    source='manual',
+                    title=row.get('match_title') or row.get('name'),
+                )
                 # Point queue meta at the local folder so download adopts it.
                 try:
                     self.store.set_gallery_meta(
@@ -2870,7 +2920,15 @@ class App(ttk.Frame):
             except Exception as e:
                 self.ui_log(f'Enqueue failed: {e}')
                 continue
-            self._insert_queue_url(url, source='manual')
+            title = (row.get('match_title') or row.get('name') or '').strip() or None
+            total = row.get('match_image_total')
+            try:
+                total_i = int(total) if total is not None else None
+            except (TypeError, ValueError):
+                total_i = None
+            self._insert_queue_url(
+                url, source='manual', title=title, image_total=total_i
+            )
             row['in_queue'] = True
             self._import_refresh_row(iid)
             added += 1
@@ -2943,6 +3001,9 @@ class App(ttk.Frame):
         base = f'Idle — {n} in queue'
         if auto_n:
             base += f' ({auto_n} auto)'
+        view_n = len(self._queue_view)
+        if self._queue_filter_raw.strip() and view_n != n:
+            base += f' · showing {view_n}'
         extra = scan_text if scan_text is not None else self._eh_scan_status
         if extra:
             base = f'{base} · {extra}'
@@ -2971,51 +3032,258 @@ class App(ttk.Frame):
             key = gallery_key_from_url(url)
             if any(gallery_key_from_url(u) == key for u in self._queue_urls):
                 continue
+            title = (m.get('title') or '').strip() or None
             try:
                 if self.store.is_completed(url) or self.store.is_queued(url):
                     continue
-                self.store.enqueue(url, source='auto')
+                self.store.enqueue(url, source='auto', title=title)
             except Exception as e:
                 self.ui_log(f'Auto-queue failed: {e}')
                 continue
-            self._insert_queue_url(url, source='auto')
+            self._insert_queue_url(url, source='auto', title=title)
             added += 1
             if self._worker and self._worker.is_alive():
                 self.job_queue.put(url)
-            title = (m.get('title') or '')[:60]
+            shown = (title or '')[:60]
             self.ui_log(
-                f'  auto-queued {key}' + (f' — {title}' if title else '')
+                f'  auto-queued {key}' + (f' — {shown}' if shown else '')
             )
         if added:
             log_feed(log, logging.INFO, 'Auto-queued %s gallery(ies) from EH hash', added)
             self._refresh_idle_status()
 
-    def _insert_queue_url(self, url: str, *, source: str = 'manual'):
-        """Keep manuals ahead of autos in the listbox."""
+    def _queue_label(self, url: str) -> str:
+        """Listbox text: gallery name (+ image count) alongside URL when known."""
+        title = (self._queue_titles.get(url) or '').strip()
+        total = self._queue_totals.get(url)
+        count_bit = f' ({total})' if isinstance(total, int) and total > 0 else ''
+        if not title:
+            base = f'{url}{count_bit}' if count_bit else url
+        else:
+            shown = title if len(title) <= 80 else title[:77] + '…'
+            base = f'{shown}{count_bit}  |  {url}'
+        if url == self._current_url:
+            return f'▶ {base}'
+        return base
+
+    def _remember_queue_title(self, url: str, title: str | None):
+        t = (title or '').strip()
+        if t:
+            self._queue_titles[url] = t
+        elif url not in self._queue_titles:
+            self._queue_titles[url] = ''
+
+    def _remember_queue_total(self, url: str, image_total: int | None):
+        if image_total is None:
+            if url not in self._queue_totals:
+                self._queue_totals[url] = None
+            return
+        try:
+            n = int(image_total)
+        except (TypeError, ValueError):
+            return
+        if n > 0:
+            self._queue_totals[url] = n
+
+    @staticmethod
+    def _parse_queue_filter(raw: str) -> dict:
+        """Parse filter text into name needles + image-count predicates.
+
+        Examples: ``foo bar``, ``name:"exact"``, ``images:42``, ``images:>=40``.
+        """
+        text = (raw or '').strip()
+        names: list[str] = []
+        images: list[tuple[str, int]] = []
+        if not text:
+            return {'names': names, 'images': images}
+        # images:/n: ops first, then name:"…", then bare words
+        token_re = re.compile(
+            r'(?i)(?:(?:images|n)\s*:\s*(>=|<=|>|<|=)?\s*(\d+))'
+            r'|(?:name\s*:\s*"([^"]*)")'
+            r'|(?:name\s*:\s*(\S+))'
+            r'|("([^"]*)")'
+            r'|(\S+)'
+        )
+        for m in token_re.finditer(text):
+            if m.group(2) is not None:
+                op = (m.group(1) or '=').strip() or '='
+                images.append((op, int(m.group(2))))
+            elif m.group(3) is not None:
+                if m.group(3).strip():
+                    names.append(m.group(3).strip())
+            elif m.group(4) is not None:
+                names.append(m.group(4))
+            elif m.group(6) is not None:
+                if m.group(6).strip():
+                    names.append(m.group(6).strip())
+            elif m.group(7) is not None:
+                names.append(m.group(7))
+        return {'names': names, 'images': images}
+
+    def _queue_item_matches(self, url: str, filt: dict) -> bool:
+        names = filt.get('names') or []
+        images = filt.get('images') or []
+        if not names and not images:
+            return True
+        title = (self._queue_titles.get(url) or '').casefold()
+        url_l = url.casefold()
+        key = (gallery_key_from_url(url) or '').casefold()
+        hay = f'{title} {url_l} {key}'
+        for needle in names:
+            if needle.casefold() not in hay:
+                return False
+        total = self._queue_totals.get(url)
+        for op, n in images:
+            if not isinstance(total, int):
+                return False
+            if op == '=' and total != n:
+                return False
+            if op == '>=' and not (total >= n):
+                return False
+            if op == '<=' and not (total <= n):
+                return False
+            if op == '>' and not (total > n):
+                return False
+            if op == '<' and not (total < n):
+                return False
+        return True
+
+    def _filtered_queue_urls(self) -> list[str]:
+        filt = self._parse_queue_filter(self._queue_filter_raw)
+        if not filt['names'] and not filt['images']:
+            return list(self._queue_urls)
+        return [u for u in self._queue_urls if self._queue_item_matches(u, filt)]
+
+    def _on_queue_filter_changed(self):
+        if not getattr(self, 'listbox', None):
+            return
+        try:
+            raw = self.queue_filter_var.get()
+        except tk.TclError:
+            return
+        if raw == self._queue_filter_raw:
+            return
+        self._queue_filter_raw = raw
+        self._redraw_queue_listbox()
+        self._refresh_idle_status()
+
+    def _clear_queue_filter(self):
+        self.queue_filter_var.set('')
+        self.queue_filter_entry.focus_set()
+
+    def _selected_queue_urls(self) -> list[str]:
+        out = []
+        for i in self.listbox.curselection():
+            if 0 <= i < len(self._queue_view):
+                out.append(self._queue_view[i])
+        return out
+
+    def _on_queue_context(self, event):
+        try:
+            idx = self.listbox.nearest(event.y)
+        except tk.TclError:
+            return
+        if idx < 0 or idx >= self.listbox.size():
+            return
+        if idx not in self.listbox.curselection():
+            self.listbox.selection_clear(0, 'end')
+            self.listbox.selection_set(idx)
+            self.listbox.activate(idx)
+        urls = self._selected_queue_urls()
+        if not urls:
+            return
+        menu = self._queue_menu
+        menu.delete(0, 'end')
+        menu.add_command(
+            label='Copy URL' + (f' ({len(urls)})' if len(urls) > 1 else ''),
+            command=lambda u=list(urls): self._copy_queue_urls(u),
+        )
+        if len(urls) == 1:
+            title = (self._queue_titles.get(urls[0]) or '').strip()
+            if title:
+                menu.add_command(
+                    label='Copy title',
+                    command=lambda t=title: self._copy_text(t),
+                )
+                menu.add_command(
+                    label='Filter by this title',
+                    command=lambda t=title: self._filter_queue_by_title(t),
+                )
+            total = self._queue_totals.get(urls[0])
+            if isinstance(total, int) and total > 0:
+                menu.add_command(
+                    label=f'Filter images:{total}',
+                    command=lambda n=total: self.queue_filter_var.set(f'images:{n}'),
+                )
+        menu.add_separator()
+        menu.add_command(
+            label='Search / filter…',
+            command=self._focus_queue_filter,
+        )
+        menu.add_command(label='Remove selected', command=self.remove_selected)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _copy_text(self, text: str):
+        if not text:
+            return
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(text)
+            self.update_idletasks()
+        except tk.TclError:
+            pass
+
+    def _copy_queue_urls(self, urls: list[str]):
+        text = '\n'.join(urls)
+        self._copy_text(text)
+        n = len(urls)
+        self.ui_log(f'Copied {n} URL(s) to clipboard')
+
+    def _filter_queue_by_title(self, title: str):
+        t = (title or '').strip()
+        if not t:
+            return
+        if ' ' in t or '"' in t:
+            self.queue_filter_var.set(f'name:"{t.replace(chr(34), "")}"')
+        else:
+            self.queue_filter_var.set(t)
+        self.queue_filter_entry.focus_set()
+
+    def _focus_queue_filter(self):
+        self.queue_filter_entry.focus_set()
+        self.queue_filter_entry.selection_range(0, 'end')
+
+    def _insert_queue_url(
+        self,
+        url: str,
+        *,
+        source: str = 'manual',
+        title: str | None = None,
+        image_total: int | None = None,
+        sync: bool = True,
+    ):
+        """Keep manuals ahead of autos; refresh filtered listbox view."""
         src = 'auto' if source == 'auto' else 'manual'
+        self._remember_queue_title(url, title)
+        self._remember_queue_total(url, image_total)
         if src == 'auto':
             self._queue_urls.append(url)
             self._queue_sources[url] = 'auto'
-            self.listbox.insert('end', url)
-            try:
-                self.listbox.itemconfig('end', foreground=AUTO_QUEUE_FG)
-            except tk.TclError:
-                pass
-            return
-        idx = next(
-            (
-                i for i, u in enumerate(self._queue_urls)
-                if self._queue_sources.get(u) == 'auto'
-            ),
-            len(self._queue_urls),
-        )
-        self._queue_urls.insert(idx, url)
-        self._queue_sources[url] = 'manual'
-        self.listbox.insert(idx, url)
-        try:
-            self.listbox.itemconfig(idx, foreground=MANUAL_QUEUE_FG)
-        except tk.TclError:
-            pass
+        else:
+            idx = next(
+                (
+                    i for i, u in enumerate(self._queue_urls)
+                    if self._queue_sources.get(u) == 'auto'
+                ),
+                len(self._queue_urls),
+            )
+            self._queue_urls.insert(idx, url)
+            self._queue_sources[url] = 'manual'
+        if sync:
+            self._redraw_queue_listbox(select_urls={url} if src == 'manual' else None)
 
     def _hydrate_from_store(self):
         if not self.store:
@@ -3043,8 +3311,33 @@ class App(ttk.Frame):
                 if url in self._queue_urls:
                     continue
                 src = item.get('source') or 'manual'
-                self._insert_queue_url(url, source=src)
+                title = (item.get('title') or '').strip() or None
+                if not title:
+                    key = item.get('gallery_key') or gallery_key_from_url(url)
+                    try:
+                        title = self.store.lookup_gallery_title(key) if key else None
+                    except Exception:
+                        title = None
+                    if title:
+                        try:
+                            self.store.set_gallery_meta(url, title=title)
+                        except Exception:
+                            pass
+                total = item.get('image_total')
+                try:
+                    total_i = int(total) if total is not None else None
+                except (TypeError, ValueError):
+                    total_i = None
+                self._insert_queue_url(
+                    url,
+                    source=src,
+                    title=title,
+                    image_total=total_i,
+                    sync=False,
+                )
                 restored += 1
+            if restored:
+                self._redraw_queue_listbox()
             src = getattr(self.store, '_parts', {}).get('source', '?')
             self.ui_log(f'DB: EH ready (settings from {src})')
             if restored:
@@ -3103,26 +3396,41 @@ class App(ttk.Frame):
         self._refresh_idle_status()
 
     def remove_selected(self):
-        for i in reversed(self.listbox.curselection()):
-            url = self._queue_urls[i]
+        urls = self._selected_queue_urls()
+        if not urls:
+            return
+        for url in urls:
             if self.store:
                 try:
                     self.store.remove_by_url(url)
                 except Exception as e:
                     self.ui_log(f'DB remove failed: {e}')
-            self.listbox.delete(i)
-            del self._queue_urls[i]
+            try:
+                self._queue_urls.remove(url)
+            except ValueError:
+                pass
             self._queue_sources.pop(url, None)
+            self._queue_titles.pop(url, None)
+            self._queue_totals.pop(url, None)
+        self._redraw_queue_listbox()
         if self._worker and self._worker.is_alive():
             self._rebuild_waiting_jobs()
         self._refresh_idle_status()
 
     def queue_move(self, where: int | str):
         """Reorder selected queue rows. ``where``: -1/1 step, or ``top``/``bottom``."""
-        sel = list(self.listbox.curselection())
-        if not sel:
+        sel_urls = self._selected_queue_urls()
+        if not sel_urls:
             return
-        indices = sorted(sel)
+        indices = []
+        for u in sel_urls:
+            try:
+                indices.append(self._queue_urls.index(u))
+            except ValueError:
+                pass
+        if not indices:
+            return
+        indices = sorted(indices)
         n = len(self._queue_urls)
         if where == -1 and indices[0] == 0:
             return
@@ -3160,12 +3468,17 @@ class App(ttk.Frame):
 
     def _redraw_queue_listbox(self, *, select_urls: set[str] | None = None):
         select_urls = select_urls or set()
+        view = self._filtered_queue_urls()
+        self._queue_view = view
         self.listbox.delete(0, 'end')
         first_sel = None
-        for i, url in enumerate(self._queue_urls):
-            self.listbox.insert('end', url)
-            src = self._queue_sources.get(url, 'manual')
-            fg = AUTO_QUEUE_FG if src == 'auto' else MANUAL_QUEUE_FG
+        for i, url in enumerate(view):
+            self.listbox.insert('end', self._queue_label(url))
+            if url == self._current_url:
+                fg = RUNNING_QUEUE_FG
+            else:
+                src = self._queue_sources.get(url, 'manual')
+                fg = AUTO_QUEUE_FG if src == 'auto' else MANUAL_QUEUE_FG
             try:
                 self.listbox.itemconfig(i, foreground=fg)
             except tk.TclError:
@@ -3174,6 +3487,12 @@ class App(ttk.Frame):
                 self.listbox.selection_set(i)
                 if first_sel is None:
                     first_sel = i
+        if first_sel is None and self._current_url and self._current_url in view:
+            try:
+                first_sel = view.index(self._current_url)
+                self.listbox.see(first_sel)
+            except ValueError:
+                first_sel = None
         if first_sel is not None:
             self.listbox.see(first_sel)
             self.listbox.activate(first_sel)
@@ -3212,6 +3531,9 @@ class App(ttk.Frame):
         self.listbox.delete(0, 'end')
         self._queue_urls.clear()
         self._queue_sources.clear()
+        self._queue_titles.clear()
+        self._queue_totals.clear()
+        self._queue_view = []
         self._refresh_idle_status()
 
     @staticmethod
@@ -3317,7 +3639,7 @@ class App(ttk.Frame):
                 except queue.Empty:
                     break
                 self._current_url = url
-                self.after(0, self._pop_queue_item, url)
+                self.after(0, self._mark_queue_current, url)
                 self.set_status(
                     f'Working… ({self.job_queue.qsize()} left, {workers} workers)'
                 )
@@ -3342,6 +3664,12 @@ class App(ttk.Frame):
                     workers=workers,
                     store=self.store,
                     gallery_url=url,
+                    on_meta=lambda title=None, image_total=None, u=url: self.after(
+                        0,
+                        lambda: self._update_running_queue_meta(
+                            u, title=title, image_total=image_total
+                        ),
+                    ),
                 )
                 try:
                     stats = dl.parse_gallery(url)
@@ -3372,6 +3700,11 @@ class App(ttk.Frame):
                             self.ui_log(f'DB complete failed: {e}')
                             log.exception('complete_gallery failed: %s', e)
                     done += 1
+                    if self._lifecycle_alive:
+                        self.after(
+                            0,
+                            lambda u=url, s=stats: self._finish_queue_item(u, stats=s),
+                        )
                 except Exception as e:
                     # Hot-reload replaces DownloadStopped class identity; also treat
                     # stop/teardown as cancel, never as a failed gallery.
@@ -3395,7 +3728,7 @@ class App(ttk.Frame):
                             except Exception as db_e:
                                 self.ui_log(f'DB mark_stopped failed: {db_e}')
                         if self._lifecycle_alive:
-                            self.after(0, self._requeue_front, url)
+                            self.after(0, self._release_queue_current, url)
                         break
                     msg = str(e) or type(e).__name__
                     self.ui_log(f'Gallery error: {msg}')
@@ -3406,44 +3739,86 @@ class App(ttk.Frame):
                         except Exception as db_e:
                             self.ui_log(f'DB mark_failed failed: {db_e}')
                     if self._lifecycle_alive:
-                        self.after(0, self._requeue_front, url)
-                finally:
-                    self._current_url = None
+                        self.after(0, self._release_queue_current, url)
         finally:
             if self._lifecycle_alive:
                 self.after(0, self._worker_done, done)
 
-    def _pop_queue_item(self, url):
+    def _mark_queue_current(self, url: str):
+        """Keep the active gallery visible (▶ green) so URL can be copied."""
         if not self._lifecycle_alive:
             return
-        try:
-            i = self._queue_urls.index(url)
-            del self._queue_urls[i]
-            self.listbox.delete(i)
-            # Keep _queue_sources so stop/fail can requeue with same color.
-        except (ValueError, tk.TclError):
-            pass
+        # Refresh title/total from DB if parse already wrote meta (rare race).
+        if self.store and url in self._queue_urls:
+            key = gallery_key_from_url(url)
+            try:
+                q = self.store.find_queue_by_key(key) if key else None
+            except Exception:
+                q = None
+            if q:
+                if q.get('title'):
+                    self._remember_queue_title(url, q.get('title'))
+                if q.get('image_total'):
+                    self._remember_queue_total(url, q.get('image_total'))
+        self._redraw_queue_listbox(select_urls={url} if url in self._queue_urls else None)
 
-    def _requeue_front(self, url):
+    def _update_running_queue_meta(
+        self,
+        url: str,
+        *,
+        title: str | None = None,
+        image_total: int | None = None,
+    ):
+        if not self._lifecycle_alive or url not in self._queue_urls:
+            return
+        self._remember_queue_title(url, title)
+        self._remember_queue_total(url, image_total)
+        self._redraw_queue_listbox(
+            select_urls={url} if url == self._current_url else None
+        )
+
+    def _finish_queue_item(self, url: str, *, stats: dict | None = None):
+        """Drop a completed gallery from the visible queue."""
         if not self._lifecycle_alive:
             return
-        if url in self._queue_urls:
+        if self._current_url == url:
+            self._current_url = None
+        if stats:
+            if stats.get('title'):
+                self._remember_queue_title(url, stats.get('title'))
+            if stats.get('total'):
+                self._remember_queue_total(url, stats.get('total'))
+        try:
+            self._queue_urls.remove(url)
+        except ValueError:
+            pass
+        self._queue_sources.pop(url, None)
+        self._queue_titles.pop(url, None)
+        self._queue_totals.pop(url, None)
+        self._redraw_queue_listbox()
+
+    def _release_queue_current(self, url: str):
+        """Stop/fail: leave item in queue (front for manual) and clear ▶ mark."""
+        if not self._lifecycle_alive:
+            return
+        if self._current_url == url:
+            self._current_url = None
+        if url not in self._queue_urls:
+            # User removed it while it was running — do not restore.
+            self._redraw_queue_listbox()
             return
         src = self._queue_sources.get(url, 'manual')
+        self._queue_urls.remove(url)
         if src == 'auto':
-            self._insert_queue_url(url, source='auto')
+            self._queue_urls.append(url)
         else:
             self._queue_urls.insert(0, url)
-            self._queue_sources[url] = 'manual'
-            self.listbox.insert(0, url)
-            try:
-                self.listbox.itemconfig(0, foreground=MANUAL_QUEUE_FG)
-            except tk.TclError:
-                pass
+        self._redraw_queue_listbox(select_urls={url})
 
     def _worker_done(self, done):
         if not self._lifecycle_alive:
             return
+        self._current_url = None
         self.start_btn.configure(state='normal')
         self.stop_btn.configure(state='disabled')
         if self._stop.is_set():
@@ -3454,3 +3829,4 @@ class App(ttk.Frame):
             self.set_status(f'Idle — finished {done} gallery(ies)')
         self.ui_log(f'\n=== batch finished ({done}) ===')
         log_feed(log, logging.INFO, 'Batch finished (%s gallery(ies))', done)
+        self._redraw_queue_listbox()
