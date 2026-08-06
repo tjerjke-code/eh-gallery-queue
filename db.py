@@ -386,6 +386,12 @@ class QueueStore:
                         DEFAULT (SYSUTCDATETIME()),
                     CONSTRAINT PK_eh_sha_match PRIMARY KEY (sha1, gallery_key)
                 );
+
+                -- Duped tab: user appointed a canonical home for this SHA.
+                IF COL_LENGTH(N'dbo.image_fingerprints', N'home_decided') IS NULL
+                ALTER TABLE dbo.image_fingerprints ADD
+                    home_decided BIT NOT NULL
+                        CONSTRAINT DF_fp_home_decided DEFAULT (0);
                 """
             )
             self._conn().commit()
@@ -447,7 +453,12 @@ class QueueStore:
         gallery_key: str | None = None,
         sample_path: str | None = None,
     ) -> None:
-        """Remember a filename variant for this sha1 (does not move files)."""
+        """Remember a filename variant for this sha1 (does not move files).
+
+        If ``gallery_key`` is a *new* peer for an already-decided SHA, clear
+        ``home_decided`` so Duped Undecided-only shows it again for review.
+        Extra names under an already-known gallery do not reopen.
+        """
         if not digest or len(digest) != 20:
             return
         name = (name or "").strip()[:260]
@@ -463,6 +474,18 @@ class QueueStore:
                 "SELECT 1 FROM dbo.image_fingerprints WHERE sha1 = ?", digest
             ).fetchone():
                 return
+            new_peer = False
+            if gkey:
+                known = cur.execute(
+                    """
+                    SELECT 1
+                    FROM dbo.image_name_aliases
+                    WHERE sha1 = ? AND gallery_key = ?
+                    """,
+                    digest,
+                    gkey,
+                ).fetchone()
+                new_peer = not known
             cur.execute(
                 """
                 MERGE dbo.image_name_aliases AS t
@@ -491,6 +514,18 @@ class QueueStore:
                 gkey,
                 path,
             )
+            if new_peer:
+                # New gallery shares this bytes — reopen Duped decision.
+                cur.execute(
+                    """
+                    UPDATE dbo.image_fingerprints
+                    SET home_decided = 0,
+                        updated_at = SYSUTCDATETIME()
+                    WHERE sha1 = ?
+                      AND ISNULL(home_decided, 0) = 1
+                    """,
+                    digest,
+                )
             self._conn().commit()
 
     def register_sha1(
@@ -508,6 +543,9 @@ class QueueStore:
 
         First-seen ``sample_path`` stays the canonical on-disk copy. Later galleries
         only bump ``seen_count`` and record aliases — soft meta for set matching.
+
+        EH ``f_shash`` is queued **once per SHA-1** (new fingerprint only). Pair
+        sightings in other galleries share the same digest and must not re-check.
         """
         if not digest or len(digest) != 20:
             raise ValueError("sha1 digest must be 20 bytes")
@@ -557,13 +595,220 @@ class QueueStore:
                 gallery_key=gkey,
                 sample_path=path,
             )
-        # New bytes → enqueue slow EH f_shash cross-check (idempotent).
+        # Only brand-new digests → EH f_shash. Existing / pair aliases: never.
         if is_new:
             try:
                 self.enqueue_sha_check(digest)
             except Exception:
                 pass
         return is_new
+
+    def set_fingerprint_home(
+        self,
+        digest: bytes,
+        *,
+        sample_path: str,
+        gallery_key: str | None = None,
+        decided: bool = True,
+    ) -> None:
+        """Point canonical on-disk copy at a new real file (after Duped move).
+
+        ``decided=True`` marks the SHA as resolved in the Duped tab so it can
+        drop out of the undecided filter.
+        """
+        if not digest or len(digest) != 20:
+            raise ValueError("sha1 digest must be 20 bytes")
+        path = (sample_path or "").strip()[:400]
+        if not path:
+            raise ValueError("sample_path required")
+        gkey = (gallery_key or "").strip()[:64] or None
+        with self._lock:
+            cur = self._conn().cursor()
+            cur.execute(
+                """
+                UPDATE dbo.image_fingerprints
+                SET sample_path = ?,
+                    gallery_key = COALESCE(?, gallery_key),
+                    home_decided = ?,
+                    updated_at = SYSUTCDATETIME()
+                WHERE sha1 = ?
+                """,
+                path,
+                gkey,
+                1 if decided else 0,
+                digest,
+            )
+            if gkey:
+                cur.execute(
+                    """
+                    UPDATE dbo.image_name_aliases
+                    SET sample_path = ?
+                    WHERE sha1 = ? AND gallery_key = ?
+                    """,
+                    path,
+                    digest,
+                    gkey,
+                )
+            self._conn().commit()
+
+    def list_dupe_galleries(
+        self, *, limit: int = 500, undecided_only: bool = False
+    ) -> list[dict]:
+        """Galleries that share ≥1 SHA-1 with another gallery (via aliases).
+
+        With ``undecided_only``, only galleries that still have ≥1 shared SHA
+        with ``home_decided = 0`` are returned (fully resolved homes drop out).
+        """
+        having_sql = ""
+        if undecided_only:
+            having_sql = (
+                "HAVING COUNT(DISTINCT CASE "
+                "WHEN ISNULL(f.home_decided, 0) = 0 THEN a.sha1 END) > 0"
+            )
+        with self._lock:
+            rows = self._conn().cursor().execute(
+                f"""
+                SELECT TOP (?)
+                    a.gallery_key,
+                    COUNT(DISTINCT a.sha1) AS shared_count,
+                    COUNT(DISTINCT peer.gallery_key) AS peer_count,
+                    MAX(COALESCE(g.title, q.title)) AS title,
+                    MAX(COALESCE(g.out_dir, q.out_dir)) AS out_dir,
+                    MAX(COALESCE(g.url, q.url)) AS url,
+                    COUNT(DISTINCT CASE
+                        WHEN ISNULL(f.home_decided, 0) = 0 THEN a.sha1 END
+                    ) AS undecided_count
+                FROM dbo.image_name_aliases a
+                INNER JOIN dbo.image_name_aliases peer
+                    ON peer.sha1 = a.sha1
+                   AND peer.gallery_key <> a.gallery_key
+                   AND peer.gallery_key <> N''
+                INNER JOIN dbo.image_fingerprints f ON f.sha1 = a.sha1
+                LEFT JOIN dbo.galleries g ON g.gallery_key = a.gallery_key
+                LEFT JOIN dbo.queue_items q ON q.gallery_key = a.gallery_key
+                WHERE a.gallery_key <> N''
+                GROUP BY a.gallery_key
+                {having_sql}
+                ORDER BY
+                    COUNT(DISTINCT CASE
+                        WHEN ISNULL(f.home_decided, 0) = 0 THEN a.sha1 END
+                    ) DESC,
+                    COUNT(DISTINCT a.sha1) DESC,
+                    a.gallery_key ASC
+                """,
+                int(limit),
+            ).fetchall()
+        out = []
+        for r in rows:
+            out.append(
+                {
+                    "gallery_key": r[0],
+                    "shared_count": int(r[1] or 0),
+                    "peer_count": int(r[2] or 0),
+                    "title": r[3],
+                    "out_dir": r[4],
+                    "url": r[5],
+                    "undecided_count": int(r[6] or 0),
+                }
+            )
+        return out
+
+    def list_shared_files_for_gallery(
+        self, gallery_key: str, *, undecided_only: bool = False
+    ) -> list[dict]:
+        """SHA-1s for ``gallery_key`` that also appear under other galleries."""
+        key = (gallery_key or "").strip()[:64]
+        if not key:
+            return []
+        undecided_sql = ""
+        if undecided_only:
+            undecided_sql = "AND ISNULL(f.home_decided, 0) = 0"
+        with self._lock:
+            cur = self._conn().cursor()
+            sha_rows = cur.execute(
+                f"""
+                SELECT DISTINCT a.sha1, f.sample_path, f.gallery_key, f.byte_len,
+                       f.seen_count, ISNULL(f.home_decided, 0)
+                FROM dbo.image_name_aliases a
+                INNER JOIN dbo.image_fingerprints f ON f.sha1 = a.sha1
+                WHERE a.gallery_key = ?
+                  AND EXISTS (
+                      SELECT 1
+                      FROM dbo.image_name_aliases b
+                      WHERE b.sha1 = a.sha1
+                        AND b.gallery_key <> a.gallery_key
+                        AND b.gallery_key <> N''
+                  )
+                  {undecided_sql}
+                ORDER BY a.sha1
+                """,
+                key,
+            ).fetchall()
+            if not sha_rows:
+                return []
+            digests = [bytes(r[0]) for r in sha_rows]
+            placeholders = ",".join("?" * len(digests))
+            alias_rows = cur.execute(
+                f"""
+                SELECT sha1, name, bare_name, gallery_key, sample_path
+                FROM dbo.image_name_aliases
+                WHERE sha1 IN ({placeholders})
+                ORDER BY created_at ASC, id ASC
+                """,
+                *digests,
+            ).fetchall()
+        by_sha: dict[bytes, list[dict]] = {d: [] for d in digests}
+        for r in alias_rows:
+            digest = bytes(r[0])
+            by_sha.setdefault(digest, []).append(
+                {
+                    "name": r[1],
+                    "bare_name": r[2],
+                    "gallery_key": r[3] or "",
+                    "sample_path": r[4],
+                }
+            )
+        out = []
+        for r in sha_rows:
+            digest = bytes(r[0])
+            out.append(
+                {
+                    "sha1": digest,
+                    "sha1_hex": digest.hex(),
+                    "sample_path": r[1],
+                    "home_gallery_key": r[2],
+                    "byte_len": int(r[3]) if r[3] is not None else None,
+                    "seen_count": int(r[4] or 0),
+                    "home_decided": bool(r[5]),
+                    "aliases": by_sha.get(digest, []),
+                }
+            )
+        return out
+
+    def list_gallery_ordered_names(self, gallery_key: str) -> list[dict]:
+        """Alias filenames for a gallery, sorted for neighbor context."""
+        key = (gallery_key or "").strip()[:64]
+        if not key:
+            return []
+        with self._lock:
+            rows = self._conn().cursor().execute(
+                """
+                SELECT name, bare_name, sample_path
+                FROM dbo.image_name_aliases
+                WHERE gallery_key = ?
+                ORDER BY name ASC, id ASC
+                """,
+                key,
+            ).fetchall()
+        return [
+            {
+                "name": r[0] or "",
+                "bare_name": r[1] or "",
+                "sample_path": r[2],
+            }
+            for r in rows
+            if r[0]
+        ]
 
     def get_setting(self, key: str, default: str | None = None) -> str | None:
         with self._lock:
@@ -701,7 +946,11 @@ class QueueStore:
             return qid
 
     def enqueue_sha_check(self, digest: bytes) -> bool:
-        """Queue a fingerprint for EH f_shash scan. Returns True if newly pending."""
+        """Queue a fingerprint for EH f_shash scan. Returns True if newly pending.
+
+        Idempotent per SHA-1: if any ``eh_sha_checks`` row exists (pending/done/error),
+        do not insert again. Pair aliases of the same bytes share this digest.
+        """
         if not digest or len(digest) != 20:
             return False
         with self._lock:
@@ -875,6 +1124,40 @@ class QueueStore:
             "out_dir": row[4],
             "image_total": row[5],
         }
+
+    def find_queue_by_key(self, key: str) -> dict | None:
+        """In-progress / queued gallery meta (title, out_dir) by gallery_key."""
+        key = (key or "").strip()[:64]
+        if not key:
+            return None
+        with self._lock:
+            row = self._conn().cursor().execute(
+                """
+                SELECT gallery_key, url, title, out_dir, status
+                FROM dbo.queue_items
+                WHERE gallery_key = ?
+                """,
+                key,
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "gallery_key": row[0],
+            "url": row[1],
+            "title": row[2],
+            "out_dir": row[3],
+            "status": row[4],
+        }
+
+    def resolve_gallery_meta(self, key: str) -> dict | None:
+        """Completed galleries row, else queue_items (for still-running dupes)."""
+        gal = self.find_gallery_by_key(key)
+        if gal and (gal.get("out_dir") or gal.get("title")):
+            return gal
+        q = self.find_queue_by_key(key)
+        if q:
+            return q
+        return gal or q
 
     def find_gallery_by_out_dir(self, out_dir: str) -> dict | None:
         """Match completed gallery by full folder path (case-insensitive on Windows)."""

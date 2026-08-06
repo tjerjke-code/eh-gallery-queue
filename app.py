@@ -30,7 +30,15 @@ from db import (
 )
 from eh_hash_check import EhHashCheckWorker, SEARCH_INTERVAL
 from eh_title_search import default_session, search_by_folder_name
-from local_import import import_local_gallery, list_images, scan_gallery_folders
+from fs_links import (
+    ensure_symlink,
+    move_real_file,
+    remove_path_if_link_or_dup,
+    resolve_real_file,
+    same_path,
+    strip_peer_presence,
+)
+from local_import import import_local_gallery, list_images, nat_key, scan_gallery_folders
 from logger import get_logger, log_feed
 
 log = get_logger('app')
@@ -44,6 +52,12 @@ WIN_BAD = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 # Listbox colors: manual (default) vs EH-discovered auto-queue.
 AUTO_QUEUE_FG = '#1565c0'
 MANUAL_QUEUE_FG = '#000000'
+# Duped hover filmstrip: this gallery vs peer.
+DUPED_COLOR_LEFT = '#2B6CB0'
+DUPED_COLOR_RIGHT = '#C05621'
+DUPED_COLOR_FOCUS = '#ECC94B'
+DUPED_NEIGHBOR_RADIUS = 3
+DUPED_THUMB_SIZE = 86
 
 
 class DownloadStopped(Exception):
@@ -381,6 +395,35 @@ class EHDownloader:
                             path=hit.get('sample_path'),
                             ordered_name=pic_name,
                         )
+                        # Visibility: symlink into this gallery (DB is still
+                        # source of truth; pair SHA never re-enqueues EH check).
+                        real = resolve_real_file(hit.get('sample_path'))
+                        if real is not None and not same_path(real, path):
+                            link_status = ensure_symlink(path, real)
+                            if link_status == 'ok':
+                                self.log(f'  link {pic_name} → {real.name}')
+                                if self.store:
+                                    try:
+                                        bare = strip_order_prefix(
+                                            pic_name,
+                                            index_pad_width(self._name_total),
+                                        )
+                                        self.store.record_name_alias(
+                                            digest,
+                                            name=pic_name,
+                                            bare_name=bare,
+                                            gallery_key=gallery_key_from_url(
+                                                self.gallery_url or ''
+                                            ),
+                                            sample_path=str(path),
+                                        )
+                                    except Exception:
+                                        pass
+                            elif link_status == 'failed':
+                                self.log(
+                                    f'  symlink failed for {pic_name} '
+                                    f'(enable Windows Developer Mode?)'
+                                )
                         self._bump(stats, 'skipped', pic_name)
                         return
                 part = path.with_suffix(path.suffix + '.part')
@@ -572,6 +615,20 @@ class App(ttk.Frame):
         self._import_rows: dict[str, dict] = {}
         self._import_stop = threading.Event()
         self._import_busy = False
+        self._duped_rows: dict[str, dict] = {}
+        self._duped_files: dict[str, dict] = {}
+        self._duped_stop = threading.Event()
+        self._duped_busy = False
+        self._duped_preview: tk.Toplevel | None = None
+        self._duped_preview_photos: list = []
+        self._duped_preview_iid: str | None = None
+        self._duped_preview_after: str | None = None
+        self._duped_preview_path: str | None = None
+        self._duped_gallery_sort: tuple[str, bool] = ('shared', True)  # col, reverse
+        self._duped_file_sort: tuple[str, bool] = ('name', False)
+        self._duped_focus_key: str | None = None
+        self._duped_seq_cache: dict[str, list[dict]] = {}
+        self._duped_preview_ctx: dict | None = None
 
         # --- shared: Save to ---
         top = ttk.Frame(self, padding=8)
@@ -588,11 +645,14 @@ class App(ttk.Frame):
 
         queue_tab = ttk.Frame(nb)
         import_tab = ttk.Frame(nb)
+        duped_tab = ttk.Frame(nb)
         nb.add(queue_tab, text='Queue')
         nb.add(import_tab, text='Import')
+        nb.add(duped_tab, text='Duped')
 
         self._build_queue_tab(queue_tab)
         self._build_import_tab(import_tab)
+        self._build_duped_tab(duped_tab)
 
         self.status = tk.StringVar(value='Idle')
         ttk.Label(self, textvariable=self.status, padding=8).pack(fill='x')
@@ -646,6 +706,18 @@ class App(ttk.Frame):
         btns.pack(fill='x', pady=4)
         ttk.Button(btns, text='Remove', command=self.remove_selected).pack(side='left')
         ttk.Button(btns, text='Clear', command=self.clear_queue).pack(side='left', padx=4)
+        ttk.Button(btns, text='↑', width=3, command=lambda: self.queue_move(-1)).pack(
+            side='left', padx=(12, 0)
+        )
+        ttk.Button(btns, text='↓', width=3, command=lambda: self.queue_move(1)).pack(
+            side='left', padx=2
+        )
+        ttk.Button(btns, text='Top', command=lambda: self.queue_move('top')).pack(
+            side='left', padx=(8, 0)
+        )
+        ttk.Button(btns, text='Bottom', command=lambda: self.queue_move('bottom')).pack(
+            side='left', padx=2
+        )
 
         right = ttk.Frame(mid)
         right.pack(side='left', fill='y', padx=(8, 0))
@@ -733,6 +805,163 @@ class App(ttk.Frame):
         self.import_status = tk.StringVar(value='Scan Save-to to list local galleries.')
         ttk.Label(parent, textvariable=self.import_status, padding=(8, 4)).pack(fill='x')
 
+    def _build_duped_tab(self, parent: ttk.Frame):
+        help_row = ttk.Frame(parent, padding=(8, 6))
+        help_row.pack(fill='x')
+        ttk.Label(
+            help_row,
+            text=(
+                'Hover a file = ±3 neighbors in this gallery (blue) vs peer (orange). '
+                'Move to home consolidates bytes; Strip peers removes leftover '
+                'symlinks/copies. Right-click → Explorer.'
+            ),
+        ).pack(side='left')
+
+        tools = ttk.Frame(parent, padding=(8, 0))
+        tools.pack(fill='x')
+        ttk.Button(tools, text='Refresh', command=self.duped_refresh).pack(side='left')
+        self.duped_undecided_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            tools,
+            text='Undecided only',
+            variable=self.duped_undecided_var,
+            command=self.duped_refresh,
+        ).pack(side='left', padx=(12, 0))
+        self.duped_links_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            tools,
+            text='Create symlinks in other galleries',
+            variable=self.duped_links_var,
+        ).pack(side='left', padx=(12, 0))
+        ttk.Button(
+            tools,
+            text='Move to home → selected',
+            command=lambda: self.duped_apply_home(scope='selected'),
+        ).pack(side='left', padx=(8, 2))
+        ttk.Button(
+            tools,
+            text='Move to home → all listed',
+            command=lambda: self.duped_apply_home(scope='all'),
+        ).pack(side='left', padx=2)
+        ttk.Button(
+            tools,
+            text='Strip peers → selected',
+            command=lambda: self.duped_strip_peers(scope='selected'),
+        ).pack(side='left', padx=(8, 2))
+        ttk.Button(
+            tools,
+            text='Strip peers → all listed',
+            command=lambda: self.duped_strip_peers(scope='all'),
+        ).pack(side='left', padx=2)
+
+        paned = ttk.Panedwindow(parent, orient='horizontal')
+        paned.pack(fill='both', expand=True, padx=8, pady=8)
+
+        left = ttk.Frame(paned)
+        right = ttk.Frame(paned)
+        paned.add(left, weight=1)
+        paned.add(right, weight=2)
+
+        gcols = ('gallery', 'shared', 'peers', 'folder')
+        self.duped_gallery_tree = ttk.Treeview(
+            left,
+            columns=gcols,
+            show='headings',
+            selectmode='browse',
+            height=14,
+        )
+        self._duped_bind_sortable_headings(
+            self.duped_gallery_tree,
+            {
+                'gallery': 'Gallery',
+                'shared': 'Shared',
+                'peers': 'Peers',
+                'folder': 'Folder',
+            },
+            which='gallery',
+        )
+        self.duped_gallery_tree.column('gallery', width=90, stretch=False)
+        self.duped_gallery_tree.column('shared', width=55, stretch=False, anchor='center')
+        self.duped_gallery_tree.column('peers', width=45, stretch=False, anchor='center')
+        self.duped_gallery_tree.column('folder', width=220, stretch=True)
+        gscroll = ttk.Scrollbar(
+            left, orient='vertical', command=self.duped_gallery_tree.yview
+        )
+        self.duped_gallery_tree.configure(yscrollcommand=gscroll.set)
+        self.duped_gallery_tree.pack(side='left', fill='both', expand=True)
+        gscroll.pack(side='right', fill='y')
+        self.duped_gallery_tree.bind('<<TreeviewSelect>>', self._on_duped_gallery_select)
+
+        fcols = ('name', 'this_path', 'peer', 'peer_path', 'home')
+        legend = ttk.Frame(right)
+        legend.pack(fill='x', pady=(0, 4))
+        tk.Label(
+            legend,
+            text='  This gallery  ',
+            fg='white',
+            bg=DUPED_COLOR_LEFT,
+            font=('Segoe UI', 8, 'bold'),
+        ).pack(side='left')
+        ttk.Label(legend, text='  vs  ').pack(side='left')
+        tk.Label(
+            legend,
+            text='  Peer / other  ',
+            fg='white',
+            bg=DUPED_COLOR_RIGHT,
+            font=('Segoe UI', 8, 'bold'),
+        ).pack(side='left')
+        ttk.Label(
+            legend,
+            text='   focus = yellow · right-click → Explorer',
+        ).pack(side='left', padx=(8, 0))
+
+        tree_wrap = ttk.Frame(right)
+        tree_wrap.pack(fill='both', expand=True)
+        self.duped_file_tree = ttk.Treeview(
+            tree_wrap,
+            columns=fcols,
+            show='headings',
+            selectmode='extended',
+            height=14,
+        )
+        self._duped_bind_sortable_headings(
+            self.duped_file_tree,
+            {
+                'name': 'This name',
+                'this_path': 'This path',
+                'peer': 'Peer name',
+                'peer_path': 'Peer path',
+                'home': 'Home',
+            },
+            which='file',
+        )
+        self.duped_file_tree.column('name', width=140, stretch=False)
+        self.duped_file_tree.column('this_path', width=220, stretch=True)
+        self.duped_file_tree.column('peer', width=140, stretch=False)
+        self.duped_file_tree.column('peer_path', width=220, stretch=True)
+        self.duped_file_tree.column('home', width=70, stretch=False)
+        fscroll = ttk.Scrollbar(
+            tree_wrap, orient='vertical', command=self.duped_file_tree.yview
+        )
+        self.duped_file_tree.configure(yscrollcommand=fscroll.set)
+        self.duped_file_tree.pack(side='left', fill='both', expand=True)
+        fscroll.pack(side='right', fill='y')
+        self.duped_file_tree.bind('<Motion>', self._on_duped_file_motion)
+        self.duped_file_tree.bind('<Leave>', self._on_duped_file_leave)
+        self.duped_file_tree.bind(
+            '<ButtonPress-1>', lambda _e: self._duped_hide_preview()
+        )
+        self.duped_file_tree.bind('<MouseWheel>', lambda _e: self._duped_hide_preview())
+        self.duped_file_tree.bind('<Button-3>', self._on_duped_file_context)
+        self._duped_file_menu = tk.Menu(self, tearoff=0)
+        # Click fallback if <<TreeviewSelect>> is flaky after reloads.
+        self.duped_gallery_tree.bind('<ButtonRelease-1>', self._on_duped_gallery_click)
+
+        self.duped_status = tk.StringVar(
+            value='Refresh to list galleries with shared fingerprints.'
+        )
+        ttk.Label(parent, textvariable=self.duped_status, padding=(8, 4)).pack(fill='x')
+
     def _request_reload(self):
         shell = self.winfo_toplevel()
         if hasattr(shell, 'reload_app'):
@@ -743,6 +972,8 @@ class App(ttk.Frame):
         self._lifecycle_alive = False
         self._stop.set()
         self._import_stop.set()
+        self._duped_stop.set()
+        self._duped_hide_preview()
         hw = self._hash_worker
         self._hash_worker = None
         if hw:
@@ -761,6 +992,1148 @@ class App(ttk.Frame):
         self._worker = None
         self._current_url = None
         log.info('prepare_for_reload: workers stopped')
+
+    # --- Duped tab ---
+
+    def _duped_bind_sortable_headings(
+        self,
+        tree: ttk.Treeview,
+        labels: dict[str, str],
+        *,
+        which: str,
+    ) -> None:
+        tree._duped_heading_labels = labels  # type: ignore[attr-defined]
+        for col, text in labels.items():
+            tree.heading(
+                col,
+                text=text,
+                command=lambda c=col, w=which: self._duped_sort_by(w, c),
+            )
+
+    def _duped_sort_key(self, value: str, *, numeric: bool):
+        s = (value or '').strip()
+        if numeric:
+            try:
+                return (0, int(s))
+            except ValueError:
+                return (1, s.casefold())
+        return s.casefold()
+
+    def _duped_sort_by(self, which: str, col: str):
+        if which == 'gallery':
+            tree = self.duped_gallery_tree
+            prev_col, prev_rev = self._duped_gallery_sort
+            numeric_cols = {'shared', 'peers'}
+        else:
+            tree = self.duped_file_tree
+            prev_col, prev_rev = self._duped_file_sort
+            numeric_cols = set()
+
+        reverse = not prev_rev if col == prev_col else False
+        if which == 'gallery':
+            self._duped_gallery_sort = (col, reverse)
+        else:
+            self._duped_file_sort = (col, reverse)
+
+        numeric = col in numeric_cols
+        rows = [
+            (self._duped_sort_key(tree.set(iid, col), numeric=numeric), iid)
+            for iid in tree.get_children('')
+        ]
+        rows.sort(key=lambda t: t[0], reverse=reverse)
+        for index, (_key, iid) in enumerate(rows):
+            tree.move(iid, '', index)
+
+        labels = getattr(tree, '_duped_heading_labels', {})
+        for c, base in labels.items():
+            mark = ''
+            if c == col:
+                mark = ' ▼' if reverse else ' ▲'
+            tree.heading(c, text=base + mark)
+
+    def _duped_cancel_preview_timer(self):
+        aid = self._duped_preview_after
+        self._duped_preview_after = None
+        if aid is not None:
+            try:
+                self.after_cancel(aid)
+            except Exception:
+                pass
+
+    def _duped_hide_preview(self):
+        self._duped_cancel_preview_timer()
+        self._duped_preview_iid = None
+        self._duped_preview_path = None
+        self._duped_preview_ctx = None
+        win = self._duped_preview
+        self._duped_preview = None
+        self._duped_preview_photos = []
+        if win is not None:
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+    def _on_duped_file_leave(self, _event=None):
+        win = self._duped_preview
+        if win is not None:
+            try:
+                px, py = win.winfo_pointerxy()
+                wx = win.winfo_rootx()
+                wy = win.winfo_rooty()
+                if (
+                    wx <= px <= wx + win.winfo_width()
+                    and wy <= py <= wy + win.winfo_height()
+                ):
+                    return
+            except Exception:
+                pass
+        self._duped_hide_preview()
+
+    def _on_duped_file_motion(self, event):
+        if not self._lifecycle_alive:
+            return
+        tree = self.duped_file_tree
+        iid = tree.identify_row(event.y)
+        if not iid:
+            self._duped_hide_preview()
+            return
+        if iid == self._duped_preview_iid and self._duped_preview is not None:
+            self._duped_place_preview(event.x_root, event.y_root)
+            return
+        if self._duped_preview is not None:
+            win = self._duped_preview
+            self._duped_preview = None
+            self._duped_preview_photos = []
+            self._duped_preview_path = None
+            self._duped_preview_ctx = None
+            try:
+                win.destroy()
+            except Exception:
+                pass
+        self._duped_cancel_preview_timer()
+        self._duped_preview_iid = iid
+        self._duped_preview_after = self.after(
+            140,
+            lambda: self._duped_show_preview(iid, event.x_root, event.y_root),
+        )
+
+    def _duped_place_preview(self, x_root: int, y_root: int):
+        win = self._duped_preview
+        if win is None:
+            return
+        try:
+            win.update_idletasks()
+            w = win.winfo_reqwidth()
+            h = win.winfo_reqheight()
+            sw = win.winfo_screenwidth()
+            sh = win.winfo_screenheight()
+            x = min(x_root + 16, sw - w - 8)
+            y = min(y_root + 16, sh - h - 8)
+            x = max(8, x)
+            y = max(8, y)
+            win.geometry(f'+{x}+{y}')
+        except Exception:
+            pass
+
+    def _duped_folder_path_for_key(self, gallery_key: str) -> Path | None:
+        """Configured out_dir for a gallery key (may not exist on disk yet)."""
+        row = self._duped_rows.get(gallery_key) or {}
+        out = row.get('out_dir')
+        if not out and self.store:
+            try:
+                meta = self.store.resolve_gallery_meta(gallery_key)
+            except Exception:
+                meta = None
+            out = (meta or {}).get('out_dir')
+        return Path(out) if out else None
+
+    def _duped_out_dir_for_key(self, gallery_key: str) -> Path | None:
+        p = self._duped_folder_path_for_key(gallery_key)
+        return p if p is not None and p.is_dir() else None
+
+    def _duped_display_path(self, gallery_key: str, name: str) -> str:
+        """Absolute path for UI; append (missing) when the file is gone."""
+        folder = self._duped_folder_path_for_key(gallery_key)
+        if folder is None:
+            return '(no folder)'
+        if name:
+            path = folder / name
+            if path.exists() or path.is_symlink():
+                return str(path)
+            return f'{path} (missing)'
+        if folder.is_dir():
+            return str(folder)
+        return f'{folder} (missing)'
+
+    def _duped_slot_path(
+        self, folder: Path | None, name: str, sample_path: str | None
+    ) -> Path | None:
+        """Resolve on-disk bytes for a gallery slot without borrowing another gallery's file.
+
+        After move-without-links, peer slots are often missing — return None rather
+        than matching the home copy (that skews the neighbor index).
+        """
+        if folder is not None and name:
+            local = folder / name
+            if local.exists() or local.is_symlink():
+                return local
+        if sample_path and folder is not None:
+            try:
+                sp = Path(sample_path)
+                # Only accept sample_path if it still lives under this gallery folder.
+                if same_path(sp.parent, folder) and (sp.exists() or sp.is_symlink()):
+                    return sp
+            except OSError:
+                pass
+        return None
+
+    def _duped_sequence(self, gallery_key: str) -> list[dict]:
+        """Alias-ordered slots for a gallery: ``{name, path|None}``.
+
+        Order comes from DB aliases (gallery identity), not current disk listing —
+        disk alone is wrong after move-without-links.
+        """
+        if gallery_key in self._duped_seq_cache:
+            return self._duped_seq_cache[gallery_key]
+        folder = self._duped_out_dir_for_key(gallery_key)
+        slots: list[dict] = []
+        aliases: list[dict] = []
+        if self.store:
+            try:
+                aliases = self.store.list_gallery_ordered_names(gallery_key)
+            except Exception:
+                aliases = []
+        if aliases:
+            # Stable natural order (zero-padded names sort correctly via nat_key).
+            aliases = sorted(
+                aliases,
+                key=lambda a: nat_key(a.get('name') or a.get('bare_name') or ''),
+            )
+            seen: set[str] = set()
+            for a in aliases:
+                name = (a.get('name') or a.get('bare_name') or '').strip()
+                if not name or name in seen:
+                    continue
+                seen.add(name)
+                slots.append(
+                    {
+                        'name': name,
+                        'path': self._duped_slot_path(
+                            folder, name, a.get('sample_path')
+                        ),
+                    }
+                )
+        elif folder is not None:
+            # No aliases yet — disk order only.
+            for pth in sorted(list_images(folder), key=lambda x: nat_key(x.name)):
+                slots.append({'name': pth.name, 'path': pth})
+        self._duped_seq_cache[gallery_key] = slots
+        return slots
+
+    def _duped_alias_name(self, item: dict, gallery_key: str) -> str:
+        for a in item.get('aliases') or []:
+            if a.get('gallery_key') == gallery_key:
+                return (a.get('name') or a.get('bare_name') or '').strip()
+        return ''
+
+    def _duped_index_in_seq(
+        self, seq: list[dict], item: dict, gallery_key: str
+    ) -> int | None:
+        """Index of this SHA's alias name in the gallery sequence (exact name only)."""
+        if not seq:
+            return None
+        name = self._duped_alias_name(item, gallery_key)
+        if not name:
+            return None
+        for i, slot in enumerate(seq):
+            if slot.get('name') == name:
+                return i
+        # Try bare thumb vs ordered name either direction.
+        bare = name.split('_', 1)[-1] if '_' in name and name.split('_', 1)[0].isdigit() else name
+        for i, slot in enumerate(seq):
+            sn = slot.get('name') or ''
+            if sn == bare:
+                return i
+            if '_' in sn and sn.split('_', 1)[0].isdigit() and sn.split('_', 1)[-1] == bare:
+                return i
+            if '_' in name and name.split('_', 1)[0].isdigit() and name.split('_', 1)[-1] == sn:
+                return i
+        return None
+
+    def _duped_peer_key(self, item: dict, focus_key: str) -> str | None:
+        peers = sorted({
+            a.get('gallery_key') or ''
+            for a in item.get('aliases') or []
+            if (a.get('gallery_key') or '') and a.get('gallery_key') != focus_key
+        })
+        # Prefer a peer that is not already the fingerprint home when focus is home.
+        home = (item.get('home_gallery_key') or '').strip()
+        if home and home != focus_key and home in peers:
+            return home
+        return peers[0] if peers else None
+
+    def _reveal_in_explorer(
+        self, select_path: Path | None, folder: Path | None
+    ) -> None:
+        """Open Explorer with ``select_path`` highlighted, else open ``folder``."""
+        try:
+            if select_path is not None:
+                try:
+                    if select_path.exists() or select_path.is_symlink():
+                        # absolute() — do not follow symlinks out of this gallery.
+                        abs_path = str(select_path.absolute())
+                        self._explorer_select(abs_path)
+                        return
+                except OSError:
+                    pass
+            target = folder
+            if target is None and select_path is not None:
+                target = select_path.parent
+            if target is not None and target.is_dir():
+                # Prefer selecting any image so the window still focuses a file.
+                try:
+                    images = sorted(
+                        list_images(target), key=lambda p: nat_key(p.name)
+                    )
+                except Exception:
+                    images = []
+                if images:
+                    self._explorer_select(str(images[0].absolute()))
+                    return
+                self._explorer_open_folder(str(target.absolute()))
+                return
+        except Exception as e:
+            messagebox.showerror('Explorer', f'Could not open:\n{e}')
+            return
+        messagebox.showinfo('Explorer', 'Folder not found on disk.')
+
+    @staticmethod
+    def _explorer_select(abs_path: str) -> None:
+        """Highlight a file in Explorer (reliable vs explorer /select)."""
+        import ctypes
+        from ctypes import wintypes
+
+        shell32 = ctypes.windll.shell32
+        ole32 = ctypes.windll.ole32
+
+        ILCreateFromPathW = shell32.ILCreateFromPathW
+        ILCreateFromPathW.argtypes = [wintypes.LPCWSTR]
+        ILCreateFromPathW.restype = ctypes.c_void_p
+
+        SHOpenFolderAndSelectItems = shell32.SHOpenFolderAndSelectItems
+        SHOpenFolderAndSelectItems.argtypes = [
+            ctypes.c_void_p,
+            wintypes.UINT,
+            ctypes.POINTER(ctypes.c_void_p),
+            wintypes.DWORD,
+        ]
+        SHOpenFolderAndSelectItems.restype = ctypes.HRESULT
+
+        ILFree = shell32.ILFree
+        ILFree.argtypes = [ctypes.c_void_p]
+
+        hr_init = int(ole32.CoInitialize(None) or 0)
+        # S_OK (0) → we own uninit; S_FALSE (1) → already inited on this thread.
+        need_uninit = hr_init == 0
+        try:
+            pidl = ILCreateFromPathW(abs_path)
+            if not pidl:
+                raise OSError(f'ILCreateFromPathW failed for {abs_path}')
+            try:
+                hr = SHOpenFolderAndSelectItems(pidl, 0, None, 0)
+                if hr:
+                    raise OSError(
+                        f'SHOpenFolderAndSelectItems failed ({hr:#x}) '
+                        f'for {abs_path}'
+                    )
+            finally:
+                ILFree(pidl)
+        finally:
+            if need_uninit:
+                ole32.CoUninitialize()
+
+    @staticmethod
+    def _explorer_open_folder(abs_dir: str) -> None:
+        import ctypes
+
+        rc = ctypes.windll.shell32.ShellExecuteW(
+            None,
+            'open',
+            'explorer.exe',
+            f'"{abs_dir}"',
+            None,
+            1,
+        )
+        if rc <= 32:
+            raise OSError(f'ShellExecute failed ({rc}) for {abs_dir}')
+
+    @staticmethod
+    def _duped_path_present(path: Path | None) -> bool:
+        if path is None:
+            return False
+        try:
+            return path.exists() or path.is_symlink()
+        except OSError:
+            return False
+
+    def _duped_reveal_for_gallery(self, gallery_key: str, item: dict) -> None:
+        """Select focus file in Explorer, or nearest on-disk neighbor, else folder."""
+        folder = self._duped_out_dir_for_key(gallery_key)
+        folder_any = self._duped_folder_path_for_key(gallery_key)
+        select = self._duped_nearest_reveal_path(gallery_key, item)
+        self._reveal_in_explorer(select, folder or folder_any)
+
+    def _duped_nearest_reveal_path(
+        self, gallery_key: str, item: dict
+    ) -> Path | None:
+        """Focus file if present; else closest on-disk neighbor in gallery order."""
+        seq = self._duped_sequence(gallery_key)
+        idx = self._duped_index_in_seq(seq, item, gallery_key)
+        if idx is not None and seq:
+            path = seq[idx].get('path')
+            if self._duped_path_present(path):
+                return path
+            for dist in range(1, len(seq)):
+                for j in (idx - dist, idx + dist):
+                    if 0 <= j < len(seq):
+                        cand = seq[j].get('path')
+                        if self._duped_path_present(cand):
+                            return cand
+
+        folder = self._duped_out_dir_for_key(gallery_key)
+        if folder is None:
+            return None
+        try:
+            files = sorted(list_images(folder), key=lambda p: nat_key(p.name))
+        except Exception:
+            files = []
+        if not files:
+            return None
+        name = self._duped_alias_name(item, gallery_key)
+        if not name:
+            return files[0]
+        target = nat_key(name)
+        # Insertion point among existing files → pick nearer side.
+        insert_at = 0
+        while insert_at < len(files) and nat_key(files[insert_at].name) < target:
+            insert_at += 1
+        if insert_at >= len(files):
+            return files[-1]
+        if insert_at == 0:
+            return files[0]
+        # Between two existing files — pick the previous (closer/earlier neighbor).
+        return files[insert_at - 1]
+
+    def _on_duped_file_context(self, event):
+        self._duped_hide_preview()
+        tree = self.duped_file_tree
+        iid = tree.identify_row(event.y)
+        if not iid:
+            return
+        if iid not in tree.selection():
+            tree.selection_set(iid)
+            tree.focus(iid)
+        self._duped_popup_compare_menu(
+            event.x_root, event.y_root, iid=iid
+        )
+
+    def _on_duped_preview_context(self, event):
+        ctx = self._duped_preview_ctx or {}
+        iid = ctx.get('iid')
+        if not iid:
+            return
+        self._duped_popup_compare_menu(
+            event.x_root, event.y_root, iid=iid
+        )
+        return 'break'
+
+    def _duped_popup_compare_menu(
+        self, x_root: int, y_root: int, *, iid: str
+    ) -> None:
+        item = self._duped_files.get(iid)
+        focus_key = self._duped_focus_key
+        if not item or not focus_key:
+            return
+        peer_key = self._duped_peer_key(item, focus_key)
+        this_name = self._duped_alias_name(item, focus_key) or focus_key
+        menu = self._duped_file_menu
+        menu.delete(0, 'end')
+        menu.add_command(
+            label=f'Open this gallery in Explorer  ({focus_key})',
+            command=lambda: self._duped_reveal_for_gallery(focus_key, item),
+        )
+        if peer_key:
+            peer_name = self._duped_alias_name(item, peer_key) or peer_key
+            menu.add_command(
+                label=f'Open peer gallery in Explorer  ({peer_key})',
+                command=lambda: self._duped_reveal_for_gallery(peer_key, item),
+            )
+            menu.add_separator()
+            menu.add_command(
+                label=f'This: {this_name}',
+                state='disabled',
+            )
+            menu.add_command(
+                label=f'Peer: {peer_name}',
+                state='disabled',
+            )
+        else:
+            menu.add_command(label='Open peer gallery…', state='disabled')
+        try:
+            menu.tk_popup(x_root, y_root)
+        finally:
+            menu.grab_release()
+
+    def _duped_load_thumb(self, path: Path | None, size: int = DUPED_THUMB_SIZE):
+        """Return PhotoImage or None."""
+        if path is None:
+            return None
+        try:
+            from PIL import Image, ImageTk
+        except ImportError:
+            return None
+        try:
+            with Image.open(path) as im:
+                if im.mode != 'RGB':
+                    im = im.convert('RGB')
+                im.thumbnail((size, size), Image.Resampling.LANCZOS)
+                canvas = Image.new('RGB', (size, size), (40, 40, 40))
+                ox = (size - im.width) // 2
+                oy = (size - im.height) // 2
+                canvas.paste(im, (ox, oy))
+                return ImageTk.PhotoImage(canvas)
+        except Exception:
+            return None
+
+    def _duped_build_strip(
+        self,
+        parent,
+        *,
+        gallery_key: str,
+        seq: list[dict],
+        center_idx: int | None,
+        border: str,
+        title: str,
+    ) -> None:
+        col = tk.Frame(parent, bg='#1a1a1a', highlightbackground=border, highlightthickness=3)
+        col.pack(side='left', padx=4, pady=2, fill='y')
+        tk.Label(
+            col,
+            text=f'{title}  {gallery_key}',
+            fg=border,
+            bg='#1a1a1a',
+            font=('Segoe UI', 9, 'bold'),
+        ).pack(pady=(4, 0))
+        folder = self._duped_folder_path_for_key(gallery_key)
+        folder_txt = str(folder) if folder is not None else '(no folder)'
+        if len(folder_txt) > 52:
+            folder_txt = folder_txt[:22] + '…' + folder_txt[-26:]
+        tk.Label(
+            col,
+            text=folder_txt,
+            fg='#9ae6b4' if folder is not None and folder.is_dir() else '#fc8181',
+            bg='#1a1a1a',
+            font=('Segoe UI', 7),
+        ).pack(pady=(0, 2))
+        radius = DUPED_NEIGHBOR_RADIUS
+        if center_idx is None:
+            tk.Label(
+                col, text='(no sequence match)', fg='#aaa', bg='#1a1a1a'
+            ).pack(padx=8, pady=8)
+            return
+        start = max(0, center_idx - radius)
+        end = min(len(seq), center_idx + radius + 1)
+        for i in range(start, end):
+            slot = seq[i]
+            name = slot.get('name') or '?'
+            path = slot.get('path')
+            is_focus = i == center_idx
+            cell_border = DUPED_COLOR_FOCUS if is_focus else border
+            thick = 4 if is_focus else 2
+            cell = tk.Frame(
+                col,
+                bg='#111',
+                highlightbackground=cell_border,
+                highlightthickness=thick,
+            )
+            cell.pack(padx=6, pady=2)
+            photo = self._duped_load_thumb(path)
+            if photo is not None:
+                self._duped_preview_photos.append(photo)
+                tk.Label(cell, image=photo, bg='#111').pack()
+            else:
+                tk.Label(
+                    cell,
+                    text='missing' if path is None else '?',
+                    width=10,
+                    height=4,
+                    fg='#f6ad55' if path is None else '#888',
+                    bg='#111',
+                ).pack()
+            tk.Label(
+                cell,
+                text=name[:28],
+                fg='#ddd' if is_focus else '#999',
+                bg='#111',
+                font=('Segoe UI', 7, 'bold' if is_focus else 'normal'),
+            ).pack()
+            if is_focus:
+                focus_path = (
+                    str(path)
+                    if path is not None
+                    else self._duped_display_path(gallery_key, name)
+                )
+                if len(focus_path) > 42:
+                    focus_path = focus_path[:18] + '…' + focus_path[-20:]
+                tk.Label(
+                    cell,
+                    text=focus_path,
+                    fg='#9ae6b4' if path is not None else '#fc8181',
+                    bg='#111',
+                    font=('Segoe UI', 6),
+                ).pack()
+
+    def _duped_show_preview(self, iid: str, x_root: int, y_root: int):
+        self._duped_preview_after = None
+        if not self._lifecycle_alive or iid != self._duped_preview_iid:
+            return
+        item = self._duped_files.get(iid)
+        focus_key = self._duped_focus_key
+        if not item or not focus_key:
+            self._duped_hide_preview()
+            return
+
+        peer_key = self._duped_peer_key(item, focus_key)
+        left_seq = self._duped_sequence(focus_key)
+        left_idx = self._duped_index_in_seq(left_seq, item, focus_key)
+        right_seq: list[dict] = []
+        right_idx: int | None = None
+        if peer_key:
+            right_seq = self._duped_sequence(peer_key)
+            right_idx = self._duped_index_in_seq(right_seq, item, peer_key)
+
+        cache_key = f'{iid}:{focus_key}:{peer_key}:{left_idx}:{right_idx}'
+        if (
+            self._duped_preview is not None
+            and self._duped_preview_path == cache_key
+        ):
+            self._duped_place_preview(x_root, y_root)
+            return
+
+        win_old = self._duped_preview
+        self._duped_preview = None
+        self._duped_preview_photos = []
+        if win_old is not None:
+            try:
+                win_old.destroy()
+            except Exception:
+                pass
+
+        self._duped_preview_iid = iid
+        self._duped_preview_path = cache_key
+        self._duped_preview_ctx = {
+            'iid': iid,
+            'item': item,
+            'focus_key': focus_key,
+            'peer_key': peer_key,
+        }
+        win = tk.Toplevel(self)
+        win.overrideredirect(True)
+        try:
+            win.attributes('-topmost', True)
+        except Exception:
+            pass
+        win.configure(background='#1a1a1a')
+        win.bind('<Button-3>', self._on_duped_preview_context)
+        body = tk.Frame(win, bg='#1a1a1a', padx=6, pady=6)
+        body.pack()
+        tk.Label(
+            body,
+            text='slice · 3 above / focus / 3 below · right-click → Explorer',
+            fg='#ccc',
+            bg='#1a1a1a',
+            font=('Segoe UI', 8),
+        ).pack(anchor='w')
+        strips = tk.Frame(body, bg='#1a1a1a')
+        strips.pack()
+        self._duped_build_strip(
+            strips,
+            gallery_key=focus_key,
+            seq=left_seq,
+            center_idx=left_idx,
+            border=DUPED_COLOR_LEFT,
+            title='This gallery',
+        )
+        if peer_key:
+            self._duped_build_strip(
+                strips,
+                gallery_key=peer_key,
+                seq=right_seq,
+                center_idx=right_idx,
+                border=DUPED_COLOR_RIGHT,
+                title='Peer',
+            )
+        else:
+            tk.Label(
+                strips, text='(no peer gallery)', fg='#888', bg='#1a1a1a'
+            ).pack(side='left', padx=12)
+
+        def _bind_rclick(w):
+            w.bind('<Button-3>', self._on_duped_preview_context)
+            for child in w.winfo_children():
+                _bind_rclick(child)
+
+        _bind_rclick(win)
+        win.bind('<Leave>', self._on_duped_preview_leave)
+
+        self._duped_preview = win
+        self._duped_place_preview(x_root, y_root)
+
+    def _on_duped_preview_leave(self, event):
+        win = self._duped_preview
+        if win is None or event.widget is not win:
+            return
+        try:
+            px, py = win.winfo_pointerxy()
+            wx = win.winfo_rootx()
+            wy = win.winfo_rooty()
+            if (
+                wx <= px <= wx + win.winfo_width()
+                and wy <= py <= wy + win.winfo_height()
+            ):
+                return
+        except Exception:
+            pass
+        self._duped_hide_preview()
+
+    def duped_refresh(self):
+        if not self.store:
+            messagebox.showwarning('Duped', 'Database not ready.')
+            return
+        if self._duped_busy:
+            messagebox.showinfo('Duped', 'Busy — wait for the current job.')
+            return
+        try:
+            rows = self.store.list_dupe_galleries(
+                limit=500,
+                undecided_only=bool(self.duped_undecided_var.get()),
+            )
+        except Exception as e:
+            messagebox.showerror('Duped', f'Query failed:\n{e}')
+            return
+        prev_sel = list(self.duped_gallery_tree.selection())
+        self._duped_rows.clear()
+        self._duped_seq_cache.clear()
+        self.duped_gallery_tree.delete(*self.duped_gallery_tree.get_children())
+        self.duped_file_tree.delete(*self.duped_file_tree.get_children())
+        self._duped_files.clear()
+        for row in rows:
+            key = row['gallery_key']
+            folder = ''
+            if row.get('out_dir'):
+                folder = Path(row['out_dir']).name
+            elif row.get('title'):
+                folder = (row['title'] or '')[:80]
+            if not folder:
+                # Last resort: parent folder of any alias sample_path.
+                try:
+                    names = self.store.list_gallery_ordered_names(key)
+                except Exception:
+                    names = []
+                for a in names:
+                    sp = a.get('sample_path')
+                    if sp:
+                        folder = Path(sp).parent.name
+                        if folder:
+                            row = dict(row)
+                            row['out_dir'] = str(Path(sp).parent)
+                            break
+            iid = key
+            self._duped_rows[iid] = row
+            shared = row.get('undecided_count')
+            if shared is None or not self.duped_undecided_var.get():
+                shared = row.get('shared_count') or 0
+            self.duped_gallery_tree.insert(
+                '',
+                'end',
+                iid=iid,
+                values=(
+                    key,
+                    str(shared),
+                    str(row.get('peer_count') or 0),
+                    folder,
+                ),
+            )
+        # Re-apply last sort (toggle off by faking same-col click state).
+        col, rev = self._duped_gallery_sort
+        self._duped_gallery_sort = (col, not rev)
+        self._duped_sort_by('gallery', col)
+        mode = 'undecided' if self.duped_undecided_var.get() else 'all'
+        self.duped_status.set(
+            f'{len(rows)} gallery(ies) ({mode}) with shared files'
+        )
+        log_feed(log, logging.INFO, 'Duped refresh: %s gallery(ies)', len(rows))
+        # Restore selection if still present; else clear detail.
+        if prev_sel and prev_sel[0] in self._duped_rows:
+            self.duped_gallery_tree.selection_set(prev_sel[0])
+            self.duped_gallery_tree.focus(prev_sel[0])
+            self._on_duped_gallery_select()
+
+    def _on_duped_gallery_click(self, _event=None):
+        # Ensure file list loads even if <<TreeviewSelect>> did not fire.
+        self.after_idle(self._on_duped_gallery_select)
+
+    def _on_duped_gallery_select(self, _event=None):
+        self._duped_hide_preview()
+        sel = self.duped_gallery_tree.selection()
+        if not sel or not self.store:
+            return
+        key = sel[0]
+        self._duped_focus_key = key
+        undecided = bool(self.duped_undecided_var.get())
+        try:
+            files = self.store.list_shared_files_for_gallery(
+                key,
+                undecided_only=undecided,
+            )
+        except Exception as e:
+            log.exception('Duped detail failed for %s', key)
+            self.ui_log(f'Duped detail failed: {e}')
+            messagebox.showerror('Duped', f'Could not load shared files:\n{e}')
+            return
+        try:
+            self.duped_file_tree.delete(*self.duped_file_tree.get_children())
+            self._duped_files.clear()
+            for item in files:
+                digest = item['sha1']
+                iid = digest.hex()
+                local_name = self._duped_alias_name(item, key)
+                peer_key = self._duped_peer_key(item, key)
+                peer_name = (
+                    self._duped_alias_name(item, peer_key) if peer_key else ''
+                )
+                peer_label = ''
+                if peer_key:
+                    peer_label = (
+                        f'{peer_key}: {peer_name}' if peer_name else peer_key
+                    )
+                this_path = self._duped_display_path(key, local_name)
+                peer_path = (
+                    self._duped_display_path(peer_key, peer_name)
+                    if peer_key
+                    else ''
+                )
+                self._duped_files[iid] = item
+                self.duped_file_tree.insert(
+                    '',
+                    'end',
+                    iid=iid,
+                    values=(
+                        local_name or digest.hex()[:12],
+                        this_path,
+                        peer_label,
+                        peer_path,
+                        item.get('home_gallery_key') or '',
+                    ),
+                )
+            col, rev = self._duped_file_sort
+            self._duped_file_sort = (col, not rev)
+            self._duped_sort_by('file', col)
+        except Exception as e:
+            log.exception('Duped file tree populate failed for %s', key)
+            self.ui_log(f'Duped populate failed: {e}')
+            messagebox.showerror('Duped', f'Could not show files:\n{e}')
+            return
+        mode = 'undecided' if undecided else 'all'
+        self.duped_status.set(
+            f'{key}: {len(files)} shared file(s) ({mode}) — hover for ±3 slice'
+        )
+        log.info('Duped gallery %s → %s file(s)', key, len(files))
+
+    def _duped_file_iids(self, *, scope: str) -> list[str]:
+        """``scope`` is ``selected`` (tree selection) or ``all`` (all listed rows)."""
+        if scope == 'all':
+            return list(self.duped_file_tree.get_children())
+        return list(self.duped_file_tree.selection())
+
+    def duped_apply_home(self, *, scope: str = 'selected'):
+        if not self.store:
+            messagebox.showwarning('Duped', 'Database not ready.')
+            return
+        if self._duped_busy:
+            messagebox.showinfo('Duped', 'Apply already running.')
+            return
+        gsel = self.duped_gallery_tree.selection()
+        if not gsel:
+            messagebox.showinfo('Duped', 'Select a home gallery on the left.')
+            return
+        home_key = gsel[0]
+        home_row = self._duped_rows.get(home_key) or {}
+        home_dir = home_row.get('out_dir')
+        if not home_dir:
+            gal = None
+            try:
+                gal = self.store.resolve_gallery_meta(home_key)
+            except Exception:
+                pass
+            home_dir = (gal or {}).get('out_dir')
+        if not home_dir:
+            messagebox.showwarning(
+                'Duped',
+                f'No out_dir for gallery {home_key}. Complete/import it first.',
+            )
+            return
+
+        fsel = self._duped_file_iids(scope=scope)
+        if not fsel:
+            if scope == 'selected':
+                messagebox.showinfo(
+                    'Duped',
+                    'Select one or more files in the list, '
+                    'or use Move to home → all listed.',
+                )
+            else:
+                messagebox.showinfo('Duped', 'No shared files listed.')
+            return
+
+        items = [self._duped_files[i] for i in fsel if i in self._duped_files]
+        create_links = bool(self.duped_links_var.get())
+        n = len(items)
+        scope_label = 'all listed' if scope == 'all' else 'selected'
+        verb = 'move + link peers' if create_links else 'move without peer links'
+        if not messagebox.askyesno(
+            'Duped',
+            f'Move to home {home_key} — {n} {scope_label} file(s)\n'
+            f'({verb}).\n\n'
+            f'Destination:\n{home_dir}',
+        ):
+            return
+
+        self._duped_busy = True
+        self._duped_stop.clear()
+        self.duped_status.set(f'Applying home {home_key}…')
+
+        def work():
+            ok = 0
+            fail = 0
+            try:
+                for item in items:
+                    if self._duped_stop.is_set() or not self._lifecycle_alive:
+                        break
+                    try:
+                        self._duped_appoint_one(
+                            item,
+                            home_key=home_key,
+                            home_dir=Path(home_dir),
+                            create_links=create_links,
+                        )
+                        ok += 1
+                    except Exception as e:
+                        fail += 1
+                        self.ui_log(
+                            f"Duped move fail {item.get('sha1_hex', '')[:10]}: {e}"
+                        )
+            finally:
+                def done():
+                    self._duped_busy = False
+                    if not self._lifecycle_alive:
+                        return
+                    self.duped_status.set(
+                        f'Home apply done — ok={ok} fail={fail}'
+                    )
+                    log_feed(
+                        log,
+                        logging.INFO,
+                        'Duped home %s — ok=%s fail=%s links=%s scope=%s',
+                        home_key,
+                        ok,
+                        fail,
+                        create_links,
+                        scope_label,
+                    )
+                    # Refresh lists so decided rows drop when filter is on.
+                    self.duped_refresh()
+
+                self.after(0, done)
+
+        threading.Thread(target=work, name='duped-apply', daemon=True).start()
+
+    def duped_strip_peers(self, *, scope: str = 'selected'):
+        """Remove peer symlinks/dup copies; keep the canonical home file only."""
+        if not self.store:
+            messagebox.showwarning('Duped', 'Database not ready.')
+            return
+        if self._duped_busy:
+            messagebox.showinfo('Duped', 'Busy — wait for the current job.')
+            return
+        fsel = self._duped_file_iids(scope=scope)
+        if not fsel:
+            if scope == 'selected':
+                messagebox.showinfo(
+                    'Duped',
+                    'Select one or more files, or use Strip peers → all listed.\n'
+                    '(Uncheck Undecided only to see already-homed files.)',
+                )
+            else:
+                messagebox.showinfo('Duped', 'No shared files listed.')
+            return
+        items = [self._duped_files[i] for i in fsel if i in self._duped_files]
+        n = len(items)
+        scope_label = 'all listed' if scope == 'all' else 'selected'
+        if not messagebox.askyesno(
+            'Duped',
+            f'Strip peers for {n} {scope_label} file(s)?\n\n'
+            'Deletes symlinks (and same-size duplicate copies) in other '
+            'galleries. The home/real file is kept. DB aliases stay.',
+        ):
+            return
+
+        self._duped_busy = True
+        self._duped_stop.clear()
+        self.duped_status.set('Stripping peer links…')
+
+        def work():
+            ok = 0
+            fail = 0
+            removed = 0
+            try:
+                for item in items:
+                    if self._duped_stop.is_set() or not self._lifecycle_alive:
+                        break
+                    try:
+                        removed += self._duped_strip_peers_one(item)
+                        ok += 1
+                    except Exception as e:
+                        fail += 1
+                        self.ui_log(
+                            f"Duped strip fail {item.get('sha1_hex', '')[:10]}: {e}"
+                        )
+            finally:
+                def done():
+                    self._duped_busy = False
+                    if not self._lifecycle_alive:
+                        return
+                    self.duped_status.set(
+                        f'Strip peers done — files={ok} fail={fail} '
+                        f'removed={removed}'
+                    )
+                    log_feed(
+                        log,
+                        logging.INFO,
+                        'Duped strip peers — ok=%s fail=%s removed=%s scope=%s',
+                        ok,
+                        fail,
+                        removed,
+                        scope_label,
+                    )
+                    self._duped_seq_cache.clear()
+                    self.duped_refresh()
+
+                self.after(0, done)
+
+        threading.Thread(target=work, name='duped-strip', daemon=True).start()
+
+    def _duped_strip_peers_one(self, item: dict) -> int:
+        """Remove peer paths for one SHA. Returns number of paths removed."""
+        aliases = item.get('aliases') or []
+        real = resolve_real_file(item.get('sample_path'))
+        if real is None:
+            for a in aliases:
+                real = resolve_real_file(a.get('sample_path'))
+                if real is not None:
+                    break
+        if real is None:
+            raise FileNotFoundError(
+                'no on-disk home copy for ' + (item.get('sha1_hex') or '')[:12]
+            )
+
+        home_key = (item.get('home_gallery_key') or '').strip()
+        removed = 0
+        for a in aliases:
+            gkey = (a.get('gallery_key') or '').strip()
+            if not gkey or (home_key and gkey == home_key):
+                continue
+            gal = None
+            try:
+                gal = self.store.resolve_gallery_meta(gkey)
+            except Exception:
+                gal = None
+            out = (gal or {}).get('out_dir')
+            if not out:
+                continue
+            peer_name = a.get('name') or a.get('bare_name')
+            if not peer_name:
+                continue
+            peer_path = Path(out) / peer_name
+            status = strip_peer_presence(peer_path, real_keep=real)
+            if status in ('link', 'dup'):
+                removed += 1
+        return removed
+
+    def _duped_appoint_one(
+        self,
+        item: dict,
+        *,
+        home_key: str,
+        home_dir: Path,
+        create_links: bool,
+    ) -> None:
+        digest = item['sha1']
+        aliases = item.get('aliases') or []
+        # Preferred name in home gallery.
+        home_name = None
+        for a in aliases:
+            if a.get('gallery_key') == home_key:
+                home_name = a.get('name') or a.get('bare_name')
+                if home_name:
+                    break
+        if not home_name:
+            home_name = Path(item.get('sample_path') or 'file.bin').name
+
+        real = resolve_real_file(item.get('sample_path'))
+        if real is None:
+            # Try any alias path.
+            for a in aliases:
+                real = resolve_real_file(a.get('sample_path'))
+                if real is not None:
+                    break
+        if real is None:
+            raise FileNotFoundError('no on-disk copy for ' + digest.hex()[:12])
+
+        dest = home_dir / home_name
+        if not same_path(real, dest):
+            moved = move_real_file(real, dest)
+        else:
+            moved = Path(real)
+
+        self.store.set_fingerprint_home(
+            digest,
+            sample_path=str(moved),
+            gallery_key=home_key,
+        )
+
+        # Peer sites: symlink or remove duplicate presence (aliases stay in DB).
+        for a in aliases:
+            gkey = a.get('gallery_key') or ''
+            if not gkey or gkey == home_key:
+                continue
+            gal = self.store.resolve_gallery_meta(gkey)
+            out = (gal or {}).get('out_dir')
+            if not out:
+                continue
+            peer_name = a.get('name') or a.get('bare_name') or home_name
+            peer_path = Path(out) / peer_name
+            if create_links:
+                status = ensure_symlink(peer_path, moved)
+                if status == 'exists_real' and not same_path(peer_path, moved):
+                    try:
+                        peer_path.unlink()
+                        ensure_symlink(peer_path, moved)
+                    except OSError as e:
+                        self.ui_log(f'  peer replace failed {peer_path.name}: {e}')
+            else:
+                remove_path_if_link_or_dup(peer_path, real_keep=moved)
 
     # --- Import tab ---
 
@@ -1398,7 +2771,91 @@ class App(ttk.Frame):
             self.listbox.delete(i)
             del self._queue_urls[i]
             self._queue_sources.pop(url, None)
+        if self._worker and self._worker.is_alive():
+            self._rebuild_waiting_jobs()
         self._refresh_idle_status()
+
+    def queue_move(self, where: int | str):
+        """Reorder selected queue rows. ``where``: -1/1 step, or ``top``/``bottom``."""
+        sel = list(self.listbox.curselection())
+        if not sel:
+            return
+        indices = sorted(sel)
+        n = len(self._queue_urls)
+        if where == -1 and indices[0] == 0:
+            return
+        if where == 1 and indices[-1] == n - 1:
+            return
+        if where == 'top' and indices[0] == 0 and indices == list(range(len(indices))):
+            return
+        if where == 'bottom' and indices[-1] == n - 1 and indices == list(
+            range(n - len(indices), n)
+        ):
+            return
+
+        urls = self._queue_urls[:]
+        block = [urls[i] for i in indices]
+        for i in reversed(indices):
+            del urls[i]
+        if where == -1:
+            insert_at = indices[0] - 1
+        elif where == 1:
+            insert_at = indices[0] + 1
+        elif where == 'top':
+            insert_at = 0
+        else:
+            insert_at = len(urls)
+        for j, url in enumerate(block):
+            urls.insert(insert_at + j, url)
+
+        selected = set(block)
+        self._queue_urls = urls
+        self._redraw_queue_listbox(select_urls=selected)
+        self._persist_queue_order()
+        if self._worker and self._worker.is_alive():
+            self._rebuild_waiting_jobs()
+        self._refresh_idle_status()
+
+    def _redraw_queue_listbox(self, *, select_urls: set[str] | None = None):
+        select_urls = select_urls or set()
+        self.listbox.delete(0, 'end')
+        first_sel = None
+        for i, url in enumerate(self._queue_urls):
+            self.listbox.insert('end', url)
+            src = self._queue_sources.get(url, 'manual')
+            fg = AUTO_QUEUE_FG if src == 'auto' else MANUAL_QUEUE_FG
+            try:
+                self.listbox.itemconfig(i, foreground=fg)
+            except tk.TclError:
+                pass
+            if url in select_urls:
+                self.listbox.selection_set(i)
+                if first_sel is None:
+                    first_sel = i
+        if first_sel is not None:
+            self.listbox.see(first_sel)
+            self.listbox.activate(first_sel)
+
+    def _persist_queue_order(self):
+        if not self.store:
+            return
+        try:
+            self.store.resequence(self._queue_urls)
+        except Exception as e:
+            self.ui_log(f'DB resequence failed: {e}')
+
+    def _rebuild_waiting_jobs(self):
+        """Refill ``job_queue`` from UI order (skip the gallery currently downloading)."""
+        current = self._current_url
+        while not self.job_queue.empty():
+            try:
+                self.job_queue.get_nowait()
+            except queue.Empty:
+                break
+        for url in self._queue_urls:
+            if current and url == current:
+                continue
+            self.job_queue.put(url)
 
     def clear_queue(self):
         if self._worker and self._worker.is_alive():
@@ -1571,23 +3028,37 @@ class App(ttk.Frame):
                             self.ui_log(f'DB complete failed: {e}')
                             log.exception('complete_gallery failed: %s', e)
                     done += 1
-                except DownloadStopped:
-                    self.ui_log('Stopped by user.')
-                    log_feed(log, logging.INFO, 'Gallery stopped %s', gallery_key_from_url(url) or url)
-                    if self.store:
-                        try:
-                            self.store.mark_stopped(url)
-                        except Exception as e:
-                            self.ui_log(f'DB mark_stopped failed: {e}')
-                    if self._lifecycle_alive:
-                        self.after(0, self._requeue_front, url)
-                    break
                 except Exception as e:
-                    self.ui_log(f'Gallery error: {e}')
-                    log.exception('Gallery error for %s: %s', url, e)
+                    # Hot-reload replaces DownloadStopped class identity; also treat
+                    # stop/teardown as cancel, never as a failed gallery.
+                    stopped = (
+                        isinstance(e, DownloadStopped)
+                        or type(e).__name__ == 'DownloadStopped'
+                        or self._stop.is_set()
+                        or not self._lifecycle_alive
+                    )
+                    if stopped:
+                        self.ui_log('Stopped by user.')
+                        log_feed(
+                            log,
+                            logging.INFO,
+                            'Gallery stopped %s',
+                            gallery_key_from_url(url) or url,
+                        )
+                        if self.store:
+                            try:
+                                self.store.mark_stopped(url)
+                            except Exception as db_e:
+                                self.ui_log(f'DB mark_stopped failed: {db_e}')
+                        if self._lifecycle_alive:
+                            self.after(0, self._requeue_front, url)
+                        break
+                    msg = str(e) or type(e).__name__
+                    self.ui_log(f'Gallery error: {msg}')
+                    log.exception('Gallery error for %s: %s', url, msg)
                     if self.store:
                         try:
-                            self.store.mark_failed(url, str(e))
+                            self.store.mark_failed(url, msg)
                         except Exception as db_e:
                             self.ui_log(f'DB mark_failed failed: {db_e}')
                     if self._lifecycle_alive:

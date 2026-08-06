@@ -22,6 +22,7 @@ RELOAD_DEPS = (
     'eh_hash_check',
     'eh_title_search',
     'local_import',
+    'fs_links',
     'app',
 )
 

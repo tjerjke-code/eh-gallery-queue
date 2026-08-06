@@ -13,11 +13,15 @@
 - Already in place for this work:
   - `dbo.image_fingerprints` — exact content id (`sha1 BINARY(20)`)
   - `dbo.image_name_aliases` — ordered name + bare thumb name + gallery_key
-    per sighting (soft; canonical `sample_path` stays first copy)
-- When implementing: read aliases + bare names, score against user rules,
-  soft-rename or link into target set folders without losing alias history.
-- Related: `db.py` (`record_name_alias`, `list_name_aliases`, `register_sha1`),
-  download skip path in `app.py`, `tools/backfill_pics.py`
+    per sighting (soft; canonical `sample_path` stays first copy / Duped home)
+  - **Duped** tab — manual appoint home + move; optional peer symlinks
+  - Auto-symlink on SHA skip so empty/partial folders stay visible
+- When implementing automatic rules: read aliases + bare names, score against
+  user rules, soft-rename or link into target set folders without losing
+  alias history.
+- Related: `db.py` (`record_name_alias`, `list_name_aliases`, `register_sha1`,
+  `list_dupe_galleries`), `fs_links.py`, download skip path in `app.py`,
+  `tools/backfill_pics.py`
 
 ### Perceptual dHash for post-resize matching
 - Status: **deferred**
@@ -30,6 +34,14 @@
 - Optional: filter control if the mixed list gets noisy.
 
 ## Done (recent)
+- Queue: reorder selected rows (↑ ↓ Top Bottom); persists `position`; rebuilds
+  waiting jobs if Start is already running
+- Duped tab: shared SHA galleries, mark home, move ± peer symlinks; DB aliases
+  remain identity even without links; EH `f_shash` once per SHA-1 (pairs skip);
+  Undecided-only drops fully decided homes; a *new* peer gallery alias clears
+  `home_decided` so those SHAs reappear for review; Strip peers removes peer
+  symlinks that point at the home file (nofollow path guard)
+- Auto-symlink into gallery folder when download skips on exact SHA match
 - Local Import tab: scan pics folders, EH title search (quoted `f_search` +
   fallbacks), register into `galleries` + fingerprints, or enqueue to verify
 - EH title search helper (`eh_title_search`) — full folder names fail unquoted;
