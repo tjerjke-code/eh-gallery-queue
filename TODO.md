@@ -32,7 +32,9 @@
   - `dbo.sha1_match_groups` — user-confirmed multi-SHA identity (compare Done);
     members behave like one content id for Duped Exact + download skip
   - **Duped** tab — manual appoint home + move; optional peer symlinks
-  - Auto-symlink on SHA skip so empty/partial folders stay visible
+  - Auto-link on SHA skip (hardlink when same volume, else symlink) so
+    empty/partial folders stay visible; `tools/relink_hardlinks.py` upgrades
+    older 0-byte symlinks
   - **Set-sibling hints** (`set_siblings.py` + `name_pattern.py`): when a
     SHA-matched cluster shows a dedicated set vs mix (prefer set as home),
     synth/page holes on the mix side appear as highlighted rows in the Duped
@@ -77,7 +79,8 @@
   Undecided-only drops fully decided homes; a *new* peer gallery alias clears
   `home_decided` so those SHAs reappear for review; Strip peers removes peer
   symlinks that point at the home file (nofollow path guard)
-- Auto-symlink into gallery folder when download skips on exact SHA match
+- Auto-link into gallery folder when download skips on exact SHA match
+  (prefer hardlink; Explorer-friendly vs 0-byte symlinks)
 - Duped: Exact/Near toggle; false positives; large compare session (double-click);
   UI lives in `duped_tab.py` (`DupedTab`)
 - Local Import tab: scan pics folders, EH title search (quoted `f_search` +

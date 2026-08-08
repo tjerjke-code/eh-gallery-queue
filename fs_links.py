@@ -1,7 +1,8 @@
-"""Symlink helpers for cross-gallery duplicate visibility (Windows-friendly).
+"""Link helpers for cross-gallery duplicate visibility (Windows-friendly).
 
-Real bytes live at ``image_fingerprints.sample_path``. Other galleries get
-symlinks so folders stay browsable. DB aliases remain the source of truth
+Real bytes live at ``image_fingerprints.sample_path``. Other galleries get a
+same-volume **hardlink** (falls back to symlink) so folders stay browsable and
+image viewers see a normal non-zero file. DB aliases remain the source of truth
 even when links are omitted.
 """
 
@@ -39,11 +40,14 @@ def resolve_real_file(path: Path | str | None) -> Path | None:
 
 
 def same_path(a: Path | str | None, b: Path | str | None) -> bool:
-    """True if both paths resolve to the same file (follows symlinks)."""
+    """True if both paths name the same bytes (symlinks + hardlinks)."""
     if not a or not b:
         return False
     try:
-        return Path(a).resolve() == Path(b).resolve()
+        pa, pb = Path(a), Path(b)
+        if pa.exists() and pb.exists():
+            return pa.samefile(pb)
+        return pa.resolve() == pb.resolve()
     except OSError:
         return os.path.normcase(str(a)) == os.path.normcase(str(b))
 
@@ -60,54 +64,91 @@ def same_entry(a: Path | str | None, b: Path | str | None) -> bool:
         return os.path.normcase(str(a)) == os.path.normcase(str(b))
 
 
+def _same_drive(a: Path, b: Path) -> bool:
+    da = os.path.splitdrive(os.path.abspath(str(a)))[0].casefold()
+    db = os.path.splitdrive(os.path.abspath(str(b)))[0].casefold()
+    return bool(da) and da == db
+
+
+def _link_to_target(link: Path, target: Path) -> bool:
+    """Create hardlink when possible, else symlink. ``link`` must not exist."""
+    if _same_drive(link, target):
+        try:
+            os.link(str(target), str(link))
+            return True
+        except OSError:
+            pass
+    try:
+        try:
+            rel = os.path.relpath(target, start=link.parent)
+            os.symlink(rel, link, target_is_directory=False)
+        except ValueError:
+            os.symlink(str(target), link, target_is_directory=False)
+        return True
+    except OSError:
+        try:
+            os.symlink(str(target), link, target_is_directory=False)
+            return True
+        except OSError:
+            return False
+
+
 def ensure_symlink(link: Path, target: Path) -> str:
-    """Ensure ``link`` is a symlink to ``target``.
+    """Ensure ``link`` refers to ``target`` bytes (hardlink preferred).
 
     Returns one of: ``ok``, ``exists_real``, ``same``, ``failed``.
     """
     link = Path(link)
     target = Path(target)
-    if not target.is_file():
-        return "failed"
+    if not target.is_file() or target.is_symlink():
+        # Prefer a non-symlink endpoint when the target path is itself a link.
+        resolved = resolve_real_file(target)
+        if resolved is None or not resolved.is_file():
+            return "failed"
+        target = resolved
     link.parent.mkdir(parents=True, exist_ok=True)
 
     if link.exists() or link.is_symlink():
         if link.is_symlink():
-            try:
-                current = Path(os.readlink(link))
-                if not current.is_absolute():
-                    current = (link.parent / current)
-                if same_path(current, target):
+            # Already points at target → upgrade symlink to hardlink when possible.
+            if same_path(link, target):
+                if not _same_drive(link, target):
                     return "same"
-            except OSError:
-                pass
+                try:
+                    old_tgt = os.readlink(link)
+                except OSError:
+                    old_tgt = None
+                try:
+                    link.unlink()
+                except OSError:
+                    return "same"
+                try:
+                    os.link(str(target), str(link))
+                    return "ok"
+                except OSError:
+                    # Restore symlink; do not leave a hole if hardlink is refused
+                    # (e.g. NTFS per-file link limit).
+                    if old_tgt is not None and not link.exists():
+                        try:
+                            os.symlink(old_tgt, link, target_is_directory=False)
+                        except OSError:
+                            _link_to_target(link, target)
+                    return "same"
             try:
                 link.unlink()
             except OSError:
                 return "failed"
         elif link.is_file():
-            # Real file already here — do not replace.
+            # Real file / hardlink already here — do not replace a different file.
             if same_path(link, target):
                 return "same"
             return "exists_real"
         else:
             return "failed"
 
-    try:
-        # Relative symlink when same drive — nicer if folders move together.
-        try:
-            rel = os.path.relpath(target, start=link.parent)
-            os.symlink(rel, link, target_is_directory=False)
-        except ValueError:
-            # Different drives — absolute.
-            os.symlink(str(target), link, target_is_directory=False)
+    if _link_to_target(link, target):
         return "ok"
-    except OSError:
-        try:
-            os.symlink(str(target), link, target_is_directory=False)
-            return "ok"
-        except OSError:
-            return "failed"
+    return "failed"
 
 
 def remove_path_if_link_or_dup(path: Path, *, real_keep: Path) -> bool:
@@ -144,7 +185,7 @@ def remove_peer_any(path: Path, *, real_keep: Path) -> str:
 
 
 def strip_peer_presence(path: Path, *, real_keep: Path) -> str:
-    """Remove a peer symlink or same-size duplicate; never delete ``real_keep``.
+    """Remove a peer symlink, hardlink, or same-size duplicate; keep ``real_keep``.
 
     Peer symlinks that *point at* ``real_keep`` must still be removed. Do not use
     resolve()-based identity for the home guard — that treats those links as home.
@@ -166,6 +207,12 @@ def strip_peer_presence(path: Path, *, real_keep: Path) -> str:
             path.unlink()
             return "link"
         if path.is_file() and real_keep.is_file():
+            try:
+                if path.samefile(real_keep):
+                    path.unlink()
+                    return "link"
+            except OSError:
+                pass
             try:
                 if path.stat().st_size != real_keep.stat().st_size:
                     return "skip"

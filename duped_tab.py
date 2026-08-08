@@ -7,6 +7,7 @@ dir, UI drain scheduling, and lifecycle flag.
 from __future__ import annotations
 
 import logging
+import os
 import queue
 import threading
 from collections import deque
@@ -763,13 +764,19 @@ class DupedTab(ttk.Frame):
 
     @staticmethod
     def _explorer_open_folder(abs_dir: str) -> None:
+        # Open the folder itself — explorer.exe "path" mishandles [] in names.
+        try:
+            os.startfile(abs_dir)  # noqa: S606
+            return
+        except OSError:
+            pass
         import ctypes
 
         rc = ctypes.windll.shell32.ShellExecuteW(
             None,
             'open',
-            'explorer.exe',
-            f'"{abs_dir}"',
+            abs_dir,
+            None,
             None,
             1,
         )

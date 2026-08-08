@@ -398,8 +398,8 @@ class EHDownloader:
                                 self.store.merge_sha1_match(digest, hit_sha)
                             except Exception:
                                 pass
-                        # Visibility: symlink into this gallery (DB is still
-                        # source of truth; pair SHA never re-enqueues EH check).
+                        # Visibility: hardlink/symlink into this gallery (DB is
+                        # still source of truth; pair SHA never re-enqueues EH).
                         real = resolve_real_file(hit.get('sample_path'))
                         if real is not None and not same_path(real, path):
                             link_status = ensure_symlink(path, real)
@@ -424,8 +424,8 @@ class EHDownloader:
                                         pass
                             elif link_status == 'failed':
                                 self.log(
-                                    f'  symlink failed for {pic_name} '
-                                    f'(enable Windows Developer Mode?)'
+                                    f'  link failed for {pic_name} '
+                                    f'(hardlink/symlink; try Developer Mode?)'
                                 )
                         self._bump(stats, 'skipped', pic_name)
                         return
