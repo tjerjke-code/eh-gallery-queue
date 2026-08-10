@@ -10,3 +10,6 @@ logs/
 _tmp*
 *_tmp*
 *_probe*
+
+# cursor-support installs (source: D:\PycharmProjects\cursor-support — run tools/Install-CursorSupport.ps1)
+.cursor/rules/cs-*.mdc
