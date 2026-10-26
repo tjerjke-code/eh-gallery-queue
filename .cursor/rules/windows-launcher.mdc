@@ -11,19 +11,26 @@ alwaysApply: true
   `%~dp0` (next to the bat). A copy on Desktop fails silently or errors.
 - Prefer a **`.lnk` shortcut** that targets the project’s `Start.bat` and sets
   WorkingDirectory to the project folder. Shortcuts can be moved freely.
-- Create the shortcut once via Windows (right-click Start.bat → Create
-  shortcut) or an equivalent `.lnk`; do not ship a helper bat for this.
+- Create / refresh shortcuts with the WishAssistance-style installer:
+
+```text
+python -m tools.build_icons
+powershell -ExecutionPolicy Bypass -File tools\Install-DesktopShortcuts.ps1
+```
+
+  That writes `EH Gallery Queue.lnk` on the Desktop with `assets/icons/eh-prod.ico`.
 
 ## Start.bat requirements
 
 - `cd /d "%~dp0"` then launch `"%~dp0eh_gallery_queue.py"`.
-- Prefer `pythonw` (no console); fall back to `python`.
+- Prefer local `.venv\Scripts\pythonw.exe` (then `.venv\Scripts\python.exe`),
+  then PATH `pythonw` / `python`.
 - If the `.py` is missing next to the bat, **print a clear error and pause** —
   never `start` a missing script (silent failure).
-- If Python is not on PATH, print install/PATH guidance and pause.
+- If Python is not in `.venv` or on PATH, print install/PATH guidance and pause.
 
 ## Do not
 
-- Hardcode a user Desktop path into the repo.
+- Hardcode a user Desktop path into the repo (installer resolves Desktop at run time).
 - Ship a second bat that only creates shortcuts or duplicates Start without
-  resolving the project script path.
+  resolving the project script path — use `tools\Install-DesktopShortcuts.ps1`.
